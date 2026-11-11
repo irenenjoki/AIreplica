@@ -1,0 +1,10 @@
+node_modules
+uploads
+.env
+*.sqlite
+dist
+out
+coverage
+.dockerignore
+.git
+.gitignore

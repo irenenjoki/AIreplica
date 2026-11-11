@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>Local AI Chat</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f5f7fb;
+      color: #1f2937;
+    }
+
+    .app {
+      width: min(900px, 94%);
+      height: 90vh;
+      margin: 5vh auto;
+      background: white;
+      border-radius: 18px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.08);
+    }
+
+    .header {
+      padding: 20px 24px;
+      border-bottom: 1px solid #e5e7eb;
+    }
+
+    .header h1 {
+      margin: 0;
+      font-size: 20px;
+    }
+
+    .header p {
+      margin: 5px 0 0;
+      color: #6b7280;
+      font-size: 14px;
+    }
+
+    .messages {
+      flex: 1;
+      padding: 25px;
+      overflow-y: auto;
+    }
+
+    .message {
+      margin-bottom: 20px;
+      display: flex;
+    }
+
+    .message.user {
+      justify-content: flex-end;
+    }
+
+    .bubble {
+      max-width: 75%;
+      padding: 13px 16px;
+      border-radius: 14px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+
+    .user .bubble {
+      background: #111827;
+      color: white;
+    }
+
+    .assistant .bubble {
+      background: #f3f4f6;
+      color: #1f2937;
+    }
+
+    .welcome {
+      text-align: center;
+      margin-top: 20%;
+      color: #6b7280;
+    }
+
+    .welcome h2 {
+      color: #1f2937;
+    }
+
+    .input-area {
+      padding: 18px;
+      border-top: 1px solid #e5e7eb;
+    }
+
+    .input-wrapper {
+      display: flex;
+      gap: 10px;
+    }
+
+    textarea {
+      flex: 1;
+      min-height: 50px;
+      max-height: 150px;
+      resize: none;
+      padding: 14px;
+      border: 1px solid #d1d5db;
+      border-radius: 12px;
+      font: inherit;
+      outline: none;
+    }
+
+    textarea:focus {
+      border-color: #111827;
+    }
+
+    button {
+      width: 55px;
+      border: none;
+      border-radius: 12px;
+      background: #111827;
+      color: white;
+      font-size: 20px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #374151;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .typing {
+      color: #6b7280;
+      font-size: 14px;
+      margin-bottom: 15px;
+      display: none;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div class="app">
+
+    <div class="header">
+      <h1>Local AI Assistant</h1>
+      <p>Powered by Qwen 2.5 3B</p>
+    </div>
+
+    <div id="messages" class="messages">
+
+      <div class="welcome" id="welcome">
+        <h2>How can I help?</h2>
+        <p>Ask me anything.</p>
+      </div>
+
+    </div>
+
+    <div class="input-area">
+
+      <div id="typing" class="typing">
+        
+      </div>
+
+      <div class="input-wrapper">
+
+        <textarea
+          id="messageInput"
+          placeholder="Message your AI..."
+          rows="1"
+        ></textarea>
+
+        <button id="sendButton">
+          ➤
+        </button>
+
+      </div>
+
+    </div>
+
+  </div>
+
+ <script>
+
+  // ==============================
+  // GET HTML ELEMENTS
+  // ==============================
+
+  const messageInput = document.getElementById("messageInput");
+  const sendButton = document.getElementById("sendButton");
+  const messages = document.getElementById("messages");
+  const welcome = document.getElementById("welcome");
+  const typing = document.getElementById("typing");
+
+
+  // ==============================
+  // SEND MESSAGE BUTTON
+  // ==============================
+
+  sendButton.addEventListener("click", sendMessage);
+
+
+  // ==============================
+  // ENTER KEY
+  // ==============================
+
+  messageInput.addEventListener("keydown", (event) => {
+
+    // Enter sends the message
+    // Shift + Enter creates a new line
+
+    if (event.key === "Enter" && !event.shiftKey) {
+
+      event.preventDefault();
+
+      sendMessage();
+
+    }
+
+  });
+
+
+  // ==============================
+  // SEND MESSAGE
+  // ==============================
+
+  async function sendMessage() {
+
+    // Get what the user typed
+    const message = messageInput.value.trim();
+
+
+    // Don't send an empty message
+    if (!message) {
+      return;
+    }
+
+
+    // Hide welcome message
+    welcome.style.display = "none";
+
+
+    // ==========================================
+    // GET PREVIOUS CONVERSATION FROM LOCALSTORAGE
+    // ==========================================
+
+    const conversation = JSON.parse(
+      localStorage.getItem("conversation") || "[]"
+    );
+
+
+    // ==========================================
+    // DISPLAY USER MESSAGE
+    // ==========================================
+
+    addMessage("user", message);
+
+
+    // Clear input
+    messageInput.value = "";
+
+
+    // Disable button while AI is responding
+    sendButton.disabled = true;
+
+    // Show typing indicator
+    typing.style.display = "block";
+
+
+    try {
+
+      // ==========================================
+      // SEND MESSAGE + CONVERSATION TO BUN
+      // ==========================================
+
+      const response = await fetch("/chat", {
+
+        method: "POST",
+
+        headers: {
+          "Content-Type": "application/json"
+        },
+
+        body: JSON.stringify({
+
+          message: message,
+
+          conversation: conversation
+
+        })
+
+      });
+
+
+      // Convert response to JSON
+      const data = await response.json();
+
+
+      // ==========================================
+      // CHECK FOR SERVER ERROR
+      // ==========================================
+
+      if (!response.ok) {
+
+        throw new Error(
+          data.error || "Server error"
+        );
+
+      }
+
+
+      // ==========================================
+      // DISPLAY AI RESPONSE
+      // ==========================================
+
+      addMessage(
+        "assistant",
+        data.response
+      );
+
+
+    } catch (error) {
+
+      console.error(
+        "Chat error:",
+        error
+      );
+
+
+      // Show actual error in the chat
+      addMessage(
+        "assistant",
+        `Error: ${error.message}`
+      );
+
+
+    } finally {
+
+      // Re-enable send button
+      sendButton.disabled = false;
+
+
+      // Hide typing indicator
+      typing.style.display = "none";
+
+
+      // Put cursor back in input
+      messageInput.focus();
+
+    }
+
+  }
+
+
+  // ==============================
+  // ADD MESSAGE TO CHAT
+  // ==============================
+
+  function addMessage(
+    role,
+    text,
+    save = true
+  ) {
+
+    // Create message container
+    const messageElement =
+      document.createElement("div");
+
+
+    // Give it the correct class
+    // user OR assistant
+
+    messageElement.className =
+      `message ${role}`;
+
+
+    // Create message bubble
+    const bubble =
+      document.createElement("div");
+
+
+    bubble.className = "bubble";
+
+
+    // Put text inside bubble
+    bubble.textContent = text;
+
+
+    // Put bubble inside message
+    messageElement.appendChild(
+      bubble
+    );
+
+
+    // Put message inside chat
+    messages.appendChild(
+      messageElement
+    );
+
+
+    // Automatically scroll to bottom
+    messages.scrollTop =
+      messages.scrollHeight;
+
+
+    // Save message
+    if (save) {
+
+      saveMessage(
+        role,
+        text
+      );
+
+    }
+
+  }
+
+
+  // ==============================
+  // SAVE MESSAGE
+  // ==============================
+
+  function saveMessage(
+    role,
+    text
+  ) {
+
+    // Get existing conversation
+    const conversation = JSON.parse(
+      localStorage.getItem("conversation") || "[]"
+    );
+
+
+    // Add new message
+    conversation.push({
+
+      role: role,
+
+      text: text
+
+    });
+
+
+    // Save updated conversation
+    localStorage.setItem(
+
+      "conversation",
+
+      JSON.stringify(
+        conversation
+      )
+
+    );
+
+  }
+
+
+  // ==============================
+  // LOAD PREVIOUS CONVERSATION
+  // ==============================
+
+  function loadConversation() {
+
+    // Get saved conversation
+    const conversation = JSON.parse(
+      localStorage.getItem("conversation") || "[]"
+    );
+
+
+    // If conversation exists,
+    // hide welcome message
+
+    if (conversation.length > 0) {
+
+      welcome.style.display =
+        "none";
+
+    }
+
+
+    // Display every saved message
+
+    conversation.forEach(
+      (message) => {
+
+        addMessage(
+
+          message.role,
+
+          message.text,
+
+          false
+
+        );
+
+      }
+    );
+
+  }
+
+
+  // ==============================
+  // LOAD CHAT WHEN PAGE OPENS
+  // ==============================
+
+  loadConversation();
+
+
+</script>
+
+</body>
+</html>
