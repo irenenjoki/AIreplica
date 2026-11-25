@@ -12,6 +12,29 @@ const showRegister = document.getElementById("showRegister");
 const showLogin = document.getElementById("showLogin");
 const authError = document.getElementById("authError");
 const logoutBtn = document.getElementById("logoutBtn");
+
+// Older versions kept a copy of the chat in localStorage and sent it to the
+// server. History now comes from the server's database, so drop the old copy.
+localStorage.removeItem("conversation");
+
+const MAX_MESSAGE_CHARS = 8000;
+const MAX_FILES_PER_MESSAGE = 5;
+
+fetch("/api/model-info")
+  .then((response) => response.ok ? response.json() : null)
+  .then((info) => {
+    if (!info?.model) return;
+    document.querySelectorAll("[data-model-name]").forEach((element) => {
+      element.textContent = info.model;
+    });
+    const retention = info.retentionDays
+      ? `Chats are deleted automatically ${info.retentionDays} days after their last message.`
+      : "Chats are kept until you delete them.";
+    document.querySelectorAll("[data-retention]").forEach((element) => {
+      element.textContent = retention;
+    });
+  })
+  .catch(() => {});
 const userName = document.getElementById("userName");
 const userEmail = document.getElementById("userEmail");
 const userAvatar = document.getElementById("userAvatar");
@@ -149,26 +172,29 @@ async function register(name, email, password) {
 }
 
 async function logout() {
+  stopGenerating();
   await fetch("/api/auth/logout", { method: "POST" });
   currentUser = null;
   activeConversationId = null;
   activeConversationTitle = null;
   saveActiveConversation();
-  localStorage.removeItem("conversation");
-  messages.innerHTML = `
-    <div id="welcome" class="welcome">
-      <div class="welcome-icon">✦</div>
-      <h2>How can I help you?</h2>
-      <p>Ask me anything. I'm a local AI assistant powered by Qwen 2.5 3B.</p>
-      <div class="suggestions">
-        <button class="suggestion">Explain something to me</button>
-        <button class="suggestion">Help me write code</button>
-        <button class="suggestion">Help me plan a project</button>
-        <button class="suggestion">Give me ideas</button>
-      </div>
-    </div>
-  `;
+  showWelcome();
   showAuthScreen();
+}
+
+function showWelcome() {
+  const template = document.getElementById("welcomeTemplate");
+  messages.innerHTML = "";
+  messages.appendChild(template.content.cloneNode(true));
+  // Re-apply the retention text fetched at startup.
+  const known = document.querySelector("#authScreen [data-retention]");
+  messages.querySelectorAll("[data-retention]").forEach((el) => {
+    if (known) el.textContent = known.textContent;
+  });
+  document.querySelectorAll("#messages [data-model-name]").forEach((el) => {
+    const label = document.querySelector(".sidebar-title [data-model-name]");
+    if (label) el.textContent = label.textContent;
+  });
 }
 
 
@@ -223,7 +249,6 @@ logoutBtn.addEventListener("click", logout);
 const messageInput = document.getElementById("messageInput");
 const sendBtn = document.getElementById("sendBtn");
 const messages = document.getElementById("messages");
-const welcome = document.getElementById("welcome");
 const typing = document.getElementById("typing");
 const newChatBtn = document.getElementById("newChatBtn");
 const conversationList = document.getElementById("conversationList");
@@ -271,7 +296,10 @@ function renderAttachments() {
     chip.className = "attachment-chip" + (att.uploading ? " uploading" : "");
 
     const label = document.createElement("span");
-    label.textContent = att.uploading ? `Uploading ${att.filename}...` : att.filename;
+    label.textContent = att.uploading
+      ? `Uploading ${att.filename}...`
+      : att.truncated ? `${att.filename} (only the first part will be read)` : att.filename;
+    if (att.truncated) label.title = "This file is long, so only its first 8,000 characters are sent to the AI.";
     chip.appendChild(label);
 
     if (!att.uploading) {
@@ -290,7 +318,11 @@ function renderAttachments() {
 }
 
 async function uploadFile(file) {
-  const pending = { id: null, filename: file.name, uploading: true };
+  if (pendingAttachments.length >= MAX_FILES_PER_MESSAGE) {
+    alert(`You can attach up to ${MAX_FILES_PER_MESSAGE} files per message.`);
+    return;
+  }
+  const pending = { id: null, filename: file.name, uploading: true, truncated: false };
   pendingAttachments.push(pending);
   renderAttachments();
 
@@ -304,6 +336,7 @@ async function uploadFile(file) {
     if (!response.ok) throw new Error(data.error || "Upload failed");
 
     pending.id = data.file.id;
+    pending.truncated = Boolean(data.file.truncated);
     pending.uploading = false;
     renderAttachments();
   } catch (error) {
@@ -374,6 +407,7 @@ function markActiveConversationInList() {
 }
 
 async function loadConversation(id) {
+  if (id !== activeConversationId) stopGenerating();
   try {
     const response = await fetch(`/api/conversations/${id}`);
     const data = await response.json();
@@ -384,13 +418,9 @@ async function loadConversation(id) {
     saveActiveConversation();
     markActiveConversationInList();
 
-    const historyBuffer = data.messages.map((msg) => ({ role: msg.role, text: msg.content }));
-    localStorage.setItem("conversation", JSON.stringify(historyBuffer));
-
     messages.innerHTML = "";
-    data.messages.forEach((msg) => addMessage(msg.role, msg.content, false, msg.attachments || []));
+    data.messages.forEach((msg) => addMessage(msg.role, msg.content, msg.attachments || []));
 
-    if (welcome) welcome.style.display = "none";
     messageInput.focus();
   } catch (error) {
     console.error("Failed to load conversation:", error);
@@ -405,29 +435,44 @@ async function loadConversation(id) {
 // SEND MESSAGE (STREAMING)
 // ============================
 
+let currentRequest = null; // AbortController while a reply is streaming
+
+function setGenerating(isGenerating) {
+  sendBtn.classList.toggle("stop", isGenerating);
+  sendBtn.textContent = isGenerating ? "■" : "↑";
+  sendBtn.title = isGenerating ? "Stop generating" : "Send";
+  sendBtn.setAttribute("aria-label", sendBtn.title);
+}
+
 async function sendMessage() {
   const message = messageInput.value.trim();
   if (!message) return;
+
+  if (message.length > MAX_MESSAGE_CHARS) {
+    alert(`Your message is too long (max ${MAX_MESSAGE_CHARS.toLocaleString()} characters). Attach long text as a file instead.`);
+    return;
+  }
 
   if (pendingAttachments.some((a) => a.uploading)) {
     alert("Please wait for the attachment to finish uploading.");
     return;
   }
 
-  if (welcome) welcome.style.display = "none";
+  document.getElementById("welcome")?.remove();
 
-  const conversation = JSON.parse(localStorage.getItem("conversation") || "[]");
   const attachedNames = pendingAttachments.map((a) => a.filename);
-  addMessage("user", message, true, attachedNames);
+  addMessage("user", message, attachedNames);
   messageInput.value = "";
-  sendBtn.disabled = true;
   typing.style.display = "flex";
 
   const aiMessageEl = createStreamingMessage("assistant");
   let fullResponse = "";
+  currentRequest = new AbortController();
+  setGenerating(true);
 
   try {
-    const body = { message, conversation };
+    // Only the new message is sent: the server reads earlier turns from its database.
+    const body = { message };
     if (activeConversationId) body.conversationId = activeConversationId;
     if (pendingAttachments.length) body.fileIds = pendingAttachments.map((a) => a.id);
     pendingAttachments = [];
@@ -436,7 +481,8 @@ async function sendMessage() {
     const response = await fetch("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: currentRequest.signal
     });
 
     if (!response.ok || !response.body) {
@@ -458,34 +504,49 @@ async function sendMessage() {
 
       for (const line of lines) {
         if (!line.trim()) continue;
+        let json;
         try {
-          const json = JSON.parse(line);
-          if (json.chunk) {
-            if (typing.style.display !== "none") typing.style.display = "none";
-            fullResponse += json.chunk;
-            appendToStreamingMessage(aiMessageEl, json.chunk);
-          }
-          if (json.done) {
-            if (json.conversationId && !activeConversationId) {
-              activeConversationId = json.conversationId;
-              saveActiveConversation();
-              loadConversations();
-            }
-            finalizeStreamingMessage(aiMessageEl, "assistant", fullResponse);
-          }
-        } catch {}
+          json = JSON.parse(line);
+        } catch {
+          continue;
+        }
+
+        if (json.conversationId && !activeConversationId) {
+          activeConversationId = json.conversationId;
+          saveActiveConversation();
+          loadConversations();
+        }
+        if (json.status === "thinking") {
+          typing.style.display = "flex";
+        }
+        if (json.chunk) {
+          if (typing.style.display !== "none") typing.style.display = "none";
+          fullResponse += json.chunk;
+          appendToStreamingMessage(aiMessageEl, json.chunk);
+        }
+        if (json.done) {
+          finalizeStreamingMessage(aiMessageEl, fullResponse);
+        }
       }
     }
   } catch (error) {
-    console.error("Chat error:", error);
-    if (fullResponse) {
-      finalizeStreamingMessage(aiMessageEl, "assistant", fullResponse);
+    if (error.name === "AbortError") {
+      // The user pressed Stop. The server saves what was generated and marks it as stopped.
+      const note = "[Reply stopped before it finished.]";
+      fullResponse = fullResponse ? `${fullResponse}\n\n${note}` : note;
+      finalizeStreamingMessage(aiMessageEl, fullResponse);
     } else {
-      aiMessageEl.remove();
-      addMessage("assistant", `Error: ${error.message}`);
+      console.error("Chat error:", error);
+      if (fullResponse) {
+        finalizeStreamingMessage(aiMessageEl, `${fullResponse}\n\n[Connection lost before the reply finished.]`);
+      } else {
+        aiMessageEl.remove();
+        addMessage("assistant", `Error: ${error.message}`);
+      }
     }
   } finally {
-    sendBtn.disabled = false;
+    currentRequest = null;
+    setGenerating(false);
     typing.style.display = "none";
     messageInput.focus();
   }
@@ -502,7 +563,8 @@ function createStreamingMessage(role) {
 
   const avatar = document.createElement("div");
   avatar.className = "message-avatar";
-  avatar.textContent = role === "user" ? "You" : "AI";
+  if (role === "user") avatar.textContent = "You";
+  else avatar.innerHTML = '<img src="/arisa-icon.png" alt="ARISA" />';
 
   const messageContent = document.createElement("div");
   messageContent.className = "message-content";
@@ -521,11 +583,10 @@ function appendToStreamingMessage(messageEl, chunk) {
   messages.scrollTop = messages.scrollHeight;
 }
 
-function finalizeStreamingMessage(messageEl, role, text) {
+function finalizeStreamingMessage(messageEl, text) {
   if (!text) return;
   const contentEl = messageEl.querySelector(".message-content");
   contentEl.textContent = text;
-  saveMessage(role, text);
 }
 
 
@@ -533,13 +594,14 @@ function finalizeStreamingMessage(messageEl, role, text) {
 // ADD MESSAGE
 // ============================
 
-function addMessage(role, text, save = true, attachmentNames = []) {
+function addMessage(role, text, attachmentNames = []) {
   const messageElement = document.createElement("div");
   messageElement.className = `message ${role}`;
 
   const avatar = document.createElement("div");
   avatar.className = "message-avatar";
-  avatar.textContent = role === "user" ? "You" : "AI";
+  if (role === "user") avatar.textContent = "You";
+  else avatar.innerHTML = '<img src="/arisa-icon.png" alt="ARISA" />';
 
   const messageContent = document.createElement("div");
   messageContent.className = "message-content";
@@ -557,19 +619,6 @@ function addMessage(role, text, save = true, attachmentNames = []) {
 
   messages.appendChild(messageElement);
   messages.scrollTop = messages.scrollHeight;
-
-  if (save) saveMessage(role, text);
-}
-
-
-// ============================
-// SAVE MESSAGE (localStorage buffer for context)
-// ============================
-
-function saveMessage(role, text) {
-  const conversation = JSON.parse(localStorage.getItem("conversation") || "[]");
-  conversation.push({ role, text });
-  localStorage.setItem("conversation", JSON.stringify(conversation));
 }
 
 
@@ -612,23 +661,11 @@ async function deleteConversation(id) {
     if (!response.ok) throw new Error(data.error || "Failed to delete conversation");
 
     if (activeConversationId === id) {
+      stopGenerating();
       activeConversationId = null;
       activeConversationTitle = null;
       saveActiveConversation();
-      localStorage.removeItem("conversation");
-      messages.innerHTML = `
-        <div id="welcome" class="welcome">
-          <div class="welcome-icon">✦</div>
-          <h2>How can I help you?</h2>
-          <p>Ask me anything. I'm a local AI assistant powered by Qwen 2.5 3B.</p>
-          <div class="suggestions">
-            <button class="suggestion">Explain something to me</button>
-            <button class="suggestion">Help me write code</button>
-            <button class="suggestion">Help me plan a project</button>
-            <button class="suggestion">Give me ideas</button>
-          </div>
-        </div>
-      `;
+      showWelcome();
     }
     loadConversations();
   } catch (error) {
@@ -641,26 +678,75 @@ async function deleteConversation(id) {
 // NEW CHAT
 // ============================
 
+function stopGenerating() {
+  if (currentRequest) currentRequest.abort();
+}
+
 newChatBtn.addEventListener("click", () => {
+  stopGenerating();
   activeConversationId = null;
   activeConversationTitle = null;
   saveActiveConversation();
-  localStorage.removeItem("conversation");
-  messages.innerHTML = `
-    <div id="welcome" class="welcome">
-      <div class="welcome-icon">✦</div>
-      <h2>How can I help you?</h2>
-      <p>Ask me anything. I'm a local AI assistant powered by Qwen 2.5 3B.</p>
-      <div class="suggestions">
-        <button class="suggestion">Explain something to me</button>
-        <button class="suggestion">Help me write code</button>
-        <button class="suggestion">Help me plan a project</button>
-        <button class="suggestion">Give me ideas</button>
-      </div>
-    </div>
-  `;
+  markActiveConversationInList();
+  showWelcome();
   messageInput.value = "";
   messageInput.focus();
+});
+
+
+// ============================
+// DELETE ACCOUNT
+// ============================
+
+const deleteAccountBtn = document.getElementById("deleteAccountBtn");
+const deleteAccountDialog = document.getElementById("deleteAccountDialog");
+const deleteAccountForm = document.getElementById("deleteAccountForm");
+const deleteAccountPassword = document.getElementById("deleteAccountPassword");
+const deleteAccountError = document.getElementById("deleteAccountError");
+
+deleteAccountBtn.addEventListener("click", () => {
+  deleteAccountForm.reset();
+  // Always open with the password hidden, even if it was shown last time.
+  deleteAccountPassword.type = "password";
+  const toggle = deleteAccountForm.querySelector(".password-toggle");
+  toggle.classList.remove("showing");
+  toggle.title = "Show password";
+  toggle.setAttribute("aria-label", "Show password");
+  deleteAccountError.textContent = "";
+  deleteAccountDialog.showModal();
+  deleteAccountPassword.focus();
+});
+
+document.getElementById("deleteAccountCancel").addEventListener("click", () => deleteAccountDialog.close());
+
+deleteAccountForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  deleteAccountError.textContent = "";
+  const submit = deleteAccountForm.querySelector(".toast-confirm");
+  submit.disabled = true;
+  try {
+    const response = await fetch("/api/account", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: deleteAccountPassword.value })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "Could not delete account");
+    deleteAccountDialog.close();
+    stopGenerating();
+    currentUser = null;
+    activeConversationId = null;
+    activeConversationTitle = null;
+    saveActiveConversation();
+    conversationList.innerHTML = "";
+    showWelcome();
+    showAuthScreen();
+    showAuthSuccess("Your account and all of its chats and files have been deleted.");
+  } catch (error) {
+    deleteAccountError.textContent = error.message;
+  } finally {
+    submit.disabled = false;
+  }
 });
 
 
@@ -683,11 +769,14 @@ document.addEventListener("click", (event) => {
 messageInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
-    sendMessage();
+    if (!currentRequest) sendMessage();
   }
 });
 
-sendBtn.addEventListener("click", sendMessage);
+sendBtn.addEventListener("click", () => {
+  if (currentRequest) stopGenerating();
+  else sendMessage();
+});
 
 
 // ============================

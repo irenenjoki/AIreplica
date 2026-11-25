@@ -35,3 +35,12 @@ uploads
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# databases (contain user accounts, chats and uploaded file text) — never commit
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# evaluation outputs (may contain model replies); commit summaries in docs/ instead
+evals/results/

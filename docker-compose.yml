@@ -3,24 +3,28 @@ services:
     build: .
     ports:
       - "3000:3000"
-    environment:
-      - SMTP_HOST
-      - SMTP_PORT
-      - SMTP_USER
-      - SMTP_PASS
     env_file:
       - .env
+    environment:
+      # Inside Compose, Ollama is reachable by its service name, not localhost.
+      - OLLAMA_URL=http://ollama:11434
+      - DB_PATH=/data/emailai.sqlite
+      - UPLOAD_DIR=/data/uploads
+    volumes:
+      - app-data:/data
     depends_on:
       - ollama
     restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
+    # Not published to the host: only the app needs to reach it.
+    expose:
+      - "11434"
     volumes:
       - ollama-data:/root/.ollama
     restart: unless-stopped
 
 volumes:
+  app-data:
   ollama-data:

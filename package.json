@@ -7,7 +7,8 @@
     "dev": "bun run index.ts",
     "test": "bun test",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "eval": "bun run evals/run.ts"
   },
   "dependencies": {
     "mammoth": "^1.12.3",

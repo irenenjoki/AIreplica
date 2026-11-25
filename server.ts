@@ -3,20 +3,130 @@ import nodemailer from "nodemailer";
 import { PDFParse } from "pdf-parse";
 import mammoth from "mammoth";
 import { mkdirSync } from "node:fs";
-import { join, extname } from "node:path";
+import { unlink } from "node:fs/promises";
+import { join, extname, resolve, sep } from "node:path";
+import { initSchema } from "./database";
+import {
+  INPUT_LIMITS,
+  buildMessages,
+  loadLlmConfig,
+  ollamaChatBody,
+  type Attachment,
+  type HistoryTurn,
+} from "./llm";
 
-const db = new Database("emailai.sqlite");
+const db = new Database(process.env.DB_PATH?.trim() || "emailai.sqlite");
+initSchema(db);
 
 const SESSION_COOKIE = "session_id";
 const SESSION_DAYS = 30;
 const VERIFICATION_TOKEN_HOURS = 24;
+const LLM = loadLlmConfig();
+const OLLAMA_MODEL = LLM.model;
 
-const UPLOAD_DIR = "./uploads";
+const UPLOAD_DIR = process.env.UPLOAD_DIR?.trim() || "./uploads";
 const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
-const MAX_FILE_CONTEXT_CHARS = 8000; // per file, injected into chat context
+const MAX_FILE_CONTEXT_CHARS = INPUT_LIMITS.maxFileChars; // per file, injected into chat context
 const TEXT_EXTENSIONS = [".txt", ".md", ".markdown", ".csv", ".json", ".log", ".js", ".ts", ".py", ".html", ".css"];
 
+// Data retention. 0 = keep conversations until the user deletes them.
+const RETENTION_DAYS = (() => {
+  const n = Number.parseInt(process.env.RETENTION_DAYS ?? "0", 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+})();
+// Uploads that were never sent with a message are removed after this many hours.
+const ORPHAN_UPLOAD_HOURS = 24;
+// Only trust X-Forwarded-For when running behind a reverse proxy you control.
+const TRUST_PROXY = process.env.TRUST_PROXY?.trim().toLowerCase() === "true";
+
 mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// =========================
+// LOGGING & METRICS (no message content is ever logged)
+// =========================
+
+function logEvent(event: string, fields: Record<string, unknown>): void {
+  console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...fields }));
+}
+
+const chatStats = {
+  startedAt: new Date().toISOString(),
+  requests: 0,
+  completed: 0,
+  truncated: 0,
+  failed: 0,
+  timedOut: 0,
+  cancelled: 0,
+  rejectedTooLarge: 0,
+  totalLatencyMs: 0,
+  totalOutputTokens: 0,
+};
+
+// =========================
+// FILE & DATA CLEANUP
+// =========================
+
+async function removeStoredFile(storedPath: string): Promise<void> {
+  // Never delete anything outside the upload directory.
+  const root = resolve(UPLOAD_DIR) + sep;
+  const target = resolve(storedPath);
+  if (!target.startsWith(root)) return;
+  try {
+    await unlink(target);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      logEvent("file_delete_error", { error: (err as Error).message });
+    }
+  }
+}
+
+/** Delete conversations (messages, file records and uploaded files) in one go. */
+async function deleteConversations(conversationIds: number[]): Promise<void> {
+  if (conversationIds.length === 0) return;
+  const placeholders = conversationIds.map(() => "?").join(",");
+  const files = db
+    .query(`SELECT stored_path FROM files WHERE conversation_id IN (${placeholders})`)
+    .all(...conversationIds) as { stored_path: string }[];
+
+  db.transaction(() => {
+    db.run(`DELETE FROM files WHERE conversation_id IN (${placeholders})`, conversationIds);
+    db.run(`DELETE FROM messages WHERE conversation_id IN (${placeholders})`, conversationIds);
+    db.run(`DELETE FROM conversations WHERE id IN (${placeholders})`, conversationIds);
+  })();
+
+  await Promise.all(files.map((f) => removeStoredFile(f.stored_path)));
+}
+
+async function runDataCleanup(): Promise<void> {
+  try {
+    const orphans = db
+      .query(`SELECT id, stored_path FROM files WHERE message_id IS NULL AND created_at <= datetime('now', ?)`)
+      .all(`-${ORPHAN_UPLOAD_HOURS} hours`) as { id: number; stored_path: string }[];
+    if (orphans.length > 0) {
+      db.run(`DELETE FROM files WHERE id IN (${orphans.map(() => "?").join(",")})`, orphans.map((o) => o.id));
+      await Promise.all(orphans.map((o) => removeStoredFile(o.stored_path)));
+    }
+
+    let expired: { id: number }[] = [];
+    if (RETENTION_DAYS > 0) {
+      // A conversation expires when its most recent message is older than the retention period.
+      expired = db
+        .query(
+          `SELECT c.id FROM conversations c
+           WHERE COALESCE((SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id), c.created_at)
+                 <= datetime('now', ?)`
+        )
+        .all(`-${RETENTION_DAYS} days`) as { id: number }[];
+      await deleteConversations(expired.map((c) => c.id));
+    }
+
+    if (orphans.length || expired.length) {
+      logEvent("data_cleanup", { orphanUploadsRemoved: orphans.length, conversationsExpired: expired.length });
+    }
+  } catch (err) {
+    logEvent("data_cleanup_error", { error: (err as Error).message });
+  }
+}
 
 // Email configuration - using Ethereal for testing (replace with real SMTP for production)
 const EMAIL_CONFIG = {
@@ -130,6 +240,15 @@ function cleanupExpiredSessions(): void {
 }
 
 cleanupExpiredSessions();
+void runDataCleanup();
+setInterval(() => {
+  cleanupExpiredSessions();
+  void runDataCleanup();
+  const now = Date.now();
+  for (const [key, entry] of rateLimitHits) {
+    if (now > entry.resetAt) rateLimitHits.delete(key);
+  }
+}, 60 * 60 * 1000);
 
 function setSessionCookie(sessionId: string): string {
   const expires = getSessionExpiry().toUTCString();
@@ -140,36 +259,38 @@ function clearSessionCookie(): string {
   return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
 }
 
-// Simple in-memory rate limiter: 10 requests per window per IP per route
+// Simple in-memory rate limiter: `max` requests per minute per key per route
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX = 10;
+const CHAT_RATE_LIMIT_MAX = 20;
+const UPLOAD_RATE_LIMIT_MAX = 20;
 const rateLimitHits = new Map<string, { count: number; resetAt: number }>();
 
-function rateLimit(ip: string, route: string): { ok: boolean; remaining: number } {
-  const key = `${ip}:${route}`;
+function rateLimit(key: string, route: string, max = RATE_LIMIT_MAX): { ok: boolean; remaining: number } {
+  const bucket = `${key}:${route}`;
   const now = Date.now();
-  let entry = rateLimitHits.get(key);
+  let entry = rateLimitHits.get(bucket);
 
   if (!entry || now > entry.resetAt) {
     entry = { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS };
-    rateLimitHits.set(key, entry);
-    return { ok: true, remaining: RATE_LIMIT_MAX - 1 };
+    rateLimitHits.set(bucket, entry);
+    return { ok: true, remaining: max - 1 };
   }
 
   entry.count++;
-  if (entry.count > RATE_LIMIT_MAX) {
+  if (entry.count > max) {
     return { ok: false, remaining: 0 };
   }
-  return { ok: true, remaining: RATE_LIMIT_MAX - entry.count };
+  return { ok: true, remaining: max - entry.count };
 }
 
-function clientIp(req: Request): string {
-  const forwarded = req.headers.get("x-forwarded-for");
-  if (forwarded) {
-    const parts = forwarded.split(",");
-    return (parts[0] ?? "").trim();
+function clientIp(req: Request, server: { requestIP(req: Request): { address: string } | null }): string {
+  if (TRUST_PROXY) {
+    const forwarded = req.headers.get("x-forwarded-for");
+    const first = forwarded?.split(",")[0]?.trim();
+    if (first) return first;
   }
-  return "unknown";
+  return server.requestIP(req)?.address ?? "unknown";
 }
 
 function getSessionIdFromCookie(req: Request): string | null {
@@ -267,9 +388,11 @@ async function sendVerificationEmail(email: string, token: string, origin: strin
 }
 
 const server = Bun.serve({
-  port: 3000,
+  port: Number.parseInt(process.env.PORT ?? "3000", 10) || 3000,
+  // Bun's default (10s) would cut off streamed replies while the model loads or thinks.
+  idleTimeout: 255,
 
-  async fetch(req) {
+  async fetch(req, server) {
     const url = new URL(req.url);
 
     // =========================
@@ -277,7 +400,7 @@ const server = Bun.serve({
     // =========================
 
     if (url.pathname === "/api/auth/register" && req.method === "POST") {
-      const limit = rateLimit(clientIp(req), "register");
+      const limit = rateLimit(clientIp(req, server), "register");
       if (!limit.ok) {
         return Response.json({ error: "Too many requests. Try again later." }, { status: 429 });
       }
@@ -320,7 +443,7 @@ const server = Bun.serve({
     }
 
     if (url.pathname === "/api/auth/login" && req.method === "POST") {
-      const limit = rateLimit(clientIp(req), "login");
+      const limit = rateLimit(clientIp(req, server), "login");
       if (!limit.ok) {
         return Response.json({ error: "Too many requests. Try again later." }, { status: 429 });
       }
@@ -400,6 +523,10 @@ const server = Bun.serve({
     }
 
     if (url.pathname === "/api/auth/resend-verification" && req.method === "POST") {
+      const limit = rateLimit(clientIp(req, server), "resend-verification");
+      if (!limit.ok) {
+        return Response.json({ error: "Too many requests. Try again later." }, { status: 429 });
+      }
       try {
         const body = (await req.json()) as { email?: string };
         const email = body.email?.trim().toLowerCase();
@@ -457,6 +584,61 @@ const server = Bun.serve({
       );
     }
 
+    if (url.pathname === "/arisa-icon.png" && req.method === "GET") {
+      return new Response(
+        Bun.file("./public/arisa-icon.png"),
+        { headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" } }
+      );
+    }
+
+    if (url.pathname === "/api/model-info" && req.method === "GET") {
+      return Response.json({ model: OLLAMA_MODEL, retentionDays: RETENTION_DAYS });
+    }
+
+    // Public health check: really checks the database and Ollama.
+    if (url.pathname === "/health" && req.method === "GET") {
+      let databaseOk = false;
+      try {
+        db.query("SELECT 1").get();
+        databaseOk = true;
+      } catch {}
+
+      let ollamaReachable = false;
+      let modelAvailable = false;
+      try {
+        const res = await fetch(`${LLM.url}/api/tags`, { signal: AbortSignal.timeout(3000) });
+        if (res.ok) {
+          ollamaReachable = true;
+          const tags = (await res.json()) as { models?: { name: string }[] };
+          const wanted = OLLAMA_MODEL.includes(":") ? OLLAMA_MODEL : `${OLLAMA_MODEL}:latest`;
+          modelAvailable = (tags.models ?? []).some((m) => m.name === wanted);
+        }
+      } catch {}
+
+      const ok = databaseOk && ollamaReachable && modelAvailable;
+      const avgLatencyMs = chatStats.completed ? Math.round(chatStats.totalLatencyMs / chatStats.completed) : null;
+      return Response.json(
+        {
+          status: ok ? "ok" : "degraded",
+          service: "ARISA",
+          model: OLLAMA_MODEL,
+          checks: { database: databaseOk, ollama: ollamaReachable, model: modelAvailable },
+          stats: {
+            since: chatStats.startedAt,
+            requests: chatStats.requests,
+            completed: chatStats.completed,
+            truncated: chatStats.truncated,
+            failed: chatStats.failed,
+            timedOut: chatStats.timedOut,
+            cancelled: chatStats.cancelled,
+            rejectedTooLarge: chatStats.rejectedTooLarge,
+            avgLatencyMs,
+          },
+        },
+        { status: ok ? 200 : 503 }
+      );
+    }
+
     // =========================
     // PROTECTED ROUTES - require authentication
     // =========================
@@ -466,10 +648,49 @@ const server = Bun.serve({
     const user = auth;
 
     // =========================
+    // DELETE ACCOUNT (and all of the user's data)
+    // =========================
+
+    if (url.pathname === "/api/account" && req.method === "DELETE") {
+      const limit = rateLimit(clientIp(req, server), "delete-account");
+      if (!limit.ok) {
+        return Response.json({ error: "Too many requests. Try again later." }, { status: 429 });
+      }
+      try {
+        const body = (await req.json().catch(() => ({}))) as { password?: string };
+        const row = db.query(`SELECT password_hash FROM users WHERE id = ?`).get(user.id) as { password_hash: string } | undefined;
+        if (!row || !body.password || !(await verifyPassword(body.password, row.password_hash))) {
+          return Response.json({ error: "Incorrect password" }, { status: 401 });
+        }
+
+        const conversations = db.query(`SELECT id FROM conversations WHERE user_id = ?`).all(user.id) as { id: number }[];
+        await deleteConversations(conversations.map((c) => c.id));
+
+        const remainingFiles = db.query(`SELECT stored_path FROM files WHERE user_id = ?`).all(user.id) as { stored_path: string }[];
+        db.transaction(() => {
+          db.run(`DELETE FROM files WHERE user_id = ?`, [user.id]);
+          db.run(`DELETE FROM sessions WHERE user_id = ?`, [user.id]);
+          db.run(`DELETE FROM email_verifications WHERE user_id = ?`, [user.id]);
+          db.run(`DELETE FROM users WHERE id = ?`, [user.id]);
+        })();
+        await Promise.all(remainingFiles.map((f) => removeStoredFile(f.stored_path)));
+
+        logEvent("account_deleted", { conversations: conversations.length });
+        return Response.json({ success: true }, { headers: { "Set-Cookie": clearSessionCookie() } });
+      } catch (error) {
+        logEvent("account_delete_error", { error: (error as Error).message });
+        return Response.json({ error: "Could not delete account" }, { status: 500 });
+      }
+    }
+
+    // =========================
     // FILE UPLOAD API
     // =========================
 
     if (url.pathname === "/api/upload" && req.method === "POST") {
+      if (!rateLimit(`user:${user.id}`, "upload", UPLOAD_RATE_LIMIT_MAX).ok) {
+        return Response.json({ error: "Too many uploads. Please wait a minute." }, { status: 429 });
+      }
       try {
         const formData = await req.formData();
         const file = formData.get("file");
@@ -494,7 +715,8 @@ const server = Bun.serve({
           return Response.json({ error: message }, { status: 400 });
         }
 
-        if (extractedText.length > MAX_FILE_CONTEXT_CHARS) {
+        const truncated = extractedText.length > MAX_FILE_CONTEXT_CHARS;
+        if (truncated) {
           extractedText = extractedText.slice(0, MAX_FILE_CONTEXT_CHARS) + "\n\n[...truncated]";
         }
 
@@ -508,7 +730,7 @@ const server = Bun.serve({
           )
           .get(user.id, file.name, storedPath, file.type, file.size, extractedText) as { id: number; filename: string; size: number };
 
-        return Response.json({ file: record });
+        return Response.json({ file: { ...record, truncated } });
       } catch (error) {
         console.error("Upload error:", error);
         return Response.json({ error: "File upload failed" }, { status: 500 });
@@ -520,196 +742,356 @@ const server = Bun.serve({
     // =========================
 
     if (url.pathname === "/chat" && req.method === "POST") {
-      try {
-        const body = await req.json() as any;
-        const message = body.message?.trim();
+      chatStats.requests++;
+      if (!rateLimit(`user:${user.id}`, "chat", CHAT_RATE_LIMIT_MAX).ok) {
+        return Response.json({ error: "You're sending messages too quickly. Please wait a minute." }, { status: 429 });
+      }
 
+      try {
+        const body = (await req.json().catch(() => null)) as
+          | { message?: unknown; conversationId?: unknown; fileIds?: unknown }
+          | null;
+
+        // =========================
+        // VALIDATE INPUT
+        // =========================
+
+        const message = typeof body?.message === "string" ? body.message.trim() : "";
         if (!message) {
           return Response.json({ error: "Message is required" }, { status: 400 });
         }
+        if (message.length > INPUT_LIMITS.maxMessageChars) {
+          return Response.json(
+            { error: `Your message is too long (max ${INPUT_LIMITS.maxMessageChars.toLocaleString()} characters). Attach long text as a file instead.` },
+            { status: 413 }
+          );
+        }
 
-        const conversationId = body.conversationId;
+        const rawFileIds: unknown[] = Array.isArray(body?.fileIds) ? body.fileIds : [];
+        if (!rawFileIds.every((id) => Number.isSafeInteger(id) && (id as number) > 0)) {
+          return Response.json({ error: "Invalid attachment" }, { status: 400 });
+        }
+        const fileIds = [...new Set(rawFileIds as number[])];
+        if (fileIds.length > INPUT_LIMITS.maxFilesPerMessage) {
+          return Response.json(
+            { error: `You can attach up to ${INPUT_LIMITS.maxFilesPerMessage} files per message.` },
+            { status: 400 }
+          );
+        }
 
-        let conversation;
-
-        if (conversationId) {
-          const existing = db
-            .query("SELECT * FROM conversations WHERE id = ? AND user_id = ?")
-            .get(conversationId, user.id) as { id: number; title: string; created_at: string } | undefined;
-
-          if (existing) {
-            conversation = existing;
-          } else {
-            conversation = db
-              .query(`INSERT INTO conversations (user_id, title) VALUES (?, ?) RETURNING *`)
-              .get(user.id, message.length > 40 ? message.substring(0, 40) + "..." : message) as {
-                id: number; title: string; created_at: string;
-              };
-          }
-        } else {
+        let conversation: { id: number } | undefined;
+        if (Number.isSafeInteger(body?.conversationId)) {
           conversation = db
-            .query(`INSERT INTO conversations (user_id, title) VALUES (?, ?) RETURNING *`)
-            .get(user.id, message.length > 40 ? message.substring(0, 40) + "..." : message) as {
-              id: number; title: string; created_at: string;
-            };
+            .query("SELECT id FROM conversations WHERE id = ? AND user_id = ?")
+            .get(body!.conversationId as number, user.id) as { id: number } | undefined;
         }
 
         // =========================
         // ATTACHED FILES
         // =========================
 
-        const fileIds: number[] = Array.isArray(body.fileIds) ? body.fileIds : [];
-        let userContent = message;
-
+        const attachments: Attachment[] = [];
         if (fileIds.length > 0) {
           const placeholders = fileIds.map(() => "?").join(",");
-          const attachedFiles = db
+          const rows = db
             .query(`SELECT filename, extracted_text FROM files WHERE id IN (${placeholders}) AND user_id = ?`)
-            .all(...fileIds, user.id) as { filename: string; extracted_text: string }[];
-
-          if (attachedFiles.length > 0) {
-            const fileBlocks = attachedFiles
-              .map((f) => `[Attached file: ${f.filename}]\n${f.extracted_text}`)
-              .join("\n\n---\n\n");
-            userContent = `${fileBlocks}\n\n---\n\n${message}`;
+            .all(...fileIds, user.id) as { filename: string; extracted_text: string | null }[];
+          if (rows.length !== fileIds.length) {
+            return Response.json({ error: "One or more attachments were not found. Please upload them again." }, { status: 400 });
           }
+          for (const r of rows) attachments.push({ filename: r.filename, text: r.extracted_text ?? "" });
 
-          db.run(
-            `UPDATE files SET conversation_id = ? WHERE id IN (${placeholders}) AND user_id = ?`,
-            [conversation.id, ...fileIds, user.id]
+          const totalChars = attachments.reduce((n, a) => n + a.text.length, 0);
+          if (totalChars > INPUT_LIMITS.maxTotalAttachmentChars) {
+            return Response.json(
+              { error: "These attachments contain too much text to send together. Please attach fewer files." },
+              { status: 413 }
+            );
+          }
+        }
+
+        // =========================
+        // BUILD PROMPT (history comes from the database, never the client)
+        // =========================
+
+        const history: HistoryTurn[] = conversation
+          ? (db
+              .query("SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id ASC")
+              .all(conversation.id) as { role: string; content: string }[]
+            ).map((m) => ({ role: m.role === "user" ? "user" : "assistant", content: m.content }))
+          : [];
+
+        const built = buildMessages({
+          history,
+          attachments,
+          message,
+          numCtx: LLM.numCtx,
+          numPredict: LLM.numPredict,
+        });
+
+        if (!built.ok) {
+          chatStats.rejectedTooLarge++;
+          logEvent("chat_rejected", { reason: built.reason, estimatedPromptTokens: built.estimatedPromptTokens, budgetTokens: built.budgetTokens });
+          return Response.json(
+            { error: "Your message and attachments are too long for the AI model to read at once. Remove an attachment or shorten the message." },
+            { status: 413 }
           );
         }
 
         // =========================
-        // AI PROMPT
+        // SEND TO OLLAMA (STREAM) WITH TIMEOUTS AND CANCELLATION
         // =========================
 
-        const history = body.conversation || [];
+        type AbortReason = "timeout_first_byte" | "timeout_idle" | "timeout_total" | "client_cancelled";
+        const state = { abortReason: null as AbortReason | null, finished: false };
+        const abort = new AbortController();
+        const abortWith = (reason: AbortReason) => {
+          if (state.abortReason || state.finished) return;
+          state.abortReason = reason;
+          abort.abort();
+        };
+        const onClientAbort = () => abortWith("client_cancelled");
+        req.signal.addEventListener("abort", onClientAbort);
 
-        const messages = [
-          {
-            role: "system",
-            content:
-              "You are a helpful, intelligent and friendly AI assistant. " +
-              "You help with general questions, programming, coding, writing, " +
-              "email, learning, problem solving, brainstorming, explanations, " +
-              "summaries, planning, and everyday conversations. " +
-              "Give direct, natural conversational responses. " +
-              "Keep answers concise unless the user asks for detail."
-          },
-          ...history.map((entry: { role: string; text: string }) => ({
-            role: entry.role === "user" ? "user" : "assistant",
-            content: entry.text
-          })),
-          {
-            role: "user",
-            content: userContent
-          }
-        ];
+        const startedAt = performance.now();
+        const totalTimer = setTimeout(() => abortWith("timeout_total"), LLM.totalTimeoutMs);
+        let idleTimer = setTimeout(() => abortWith("timeout_first_byte"), LLM.firstByteTimeoutMs);
+        const resetIdleTimer = () => {
+          clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => abortWith("timeout_idle"), LLM.idleTimeoutMs);
+        };
+        const clearTimers = () => {
+          clearTimeout(totalTimer);
+          clearTimeout(idleTimer);
+          req.signal.removeEventListener("abort", onClientAbort);
+        };
 
-        // =========================
-        // SEND TO OLLAMA (STREAM)
-        // =========================
-
-        const ollamaResponse = await fetch(
-          "http://localhost:11434/api/chat",
-          {
+        let ollamaResponse: Response;
+        try {
+          ollamaResponse = await fetch(`${LLM.url}/api/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: "qwen2.5:3b",
-              messages: messages,
-              stream: true,
-            }),
+            body: JSON.stringify(ollamaChatBody(LLM, built.messages, true)),
+            signal: abort.signal,
+          });
+        } catch (err) {
+          clearTimers();
+          if (state.abortReason === "client_cancelled") {
+            chatStats.cancelled++;
+            return new Response(null, { status: 499 });
           }
-        );
+          const timedOut = state.abortReason !== null;
+          if (timedOut) chatStats.timedOut++;
+          else chatStats.failed++;
+          logEvent("chat_error", { stage: "connect", reason: state.abortReason ?? "unreachable", error: (err as Error).message });
+          return Response.json(
+            {
+              error: timedOut
+                ? "The AI model took too long to respond. Please try again."
+                : "Could not reach the AI model. Make sure Ollama is running.",
+            },
+            { status: timedOut ? 504 : 502 }
+          );
+        }
 
         if (!ollamaResponse.ok || !ollamaResponse.body) {
+          clearTimers();
+          const detail = (await ollamaResponse.text().catch(() => "")).slice(0, 300);
+          chatStats.failed++;
+          logEvent("chat_error", { stage: "ollama_status", status: ollamaResponse.status, detail });
           return Response.json(
-            { error: "Could not connect to Ollama. Make sure Ollama is running." },
-            { status: 500 }
+            {
+              error: ollamaResponse.status === 404
+                ? `The AI model "${OLLAMA_MODEL}" is not installed on the server.`
+                : "The AI model returned an error. Please try again.",
+            },
+            { status: 502 }
           );
         }
 
         // =========================
-        // SAVE USER MESSAGE
+        // SAVE CONVERSATION + USER MESSAGE (only once the model is responding)
         // =========================
 
-        const userMessage = db
-          .query(`INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?) RETURNING id`)
-          .get(conversation.id, "user", message) as { id: number };
+        const conversationId = db.transaction(() => {
+          const convId = conversation
+            ? conversation.id
+            : (db
+                .query(`INSERT INTO conversations (user_id, title) VALUES (?, ?) RETURNING id`)
+                .get(user.id, message.length > 40 ? message.substring(0, 40) + "..." : message) as { id: number }).id;
 
-        if (fileIds.length > 0) {
-          const placeholders = fileIds.map(() => "?").join(",");
-          db.run(
-            `UPDATE files SET message_id = ? WHERE id IN (${placeholders}) AND user_id = ?`,
-            [userMessage.id, ...fileIds, user.id]
-          );
-        }
+          const userMessage = db
+            .query(`INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?) RETURNING id`)
+            .get(convId, "user", message) as { id: number };
 
-        
+          if (fileIds.length > 0) {
+            const placeholders = fileIds.map(() => "?").join(",");
+            db.run(
+              `UPDATE files SET conversation_id = ?, message_id = ? WHERE id IN (${placeholders}) AND user_id = ?`,
+              [convId, userMessage.id, ...fileIds, user.id]
+            );
+          }
+          return convId;
+        })();
+
         // =========================
         // STREAM TOKENS TO CLIENT
         // =========================
-        
-
 
         const encoder = new TextEncoder();
         const decoder = new TextDecoder();
+        const reader = ollamaResponse.body.getReader();
+
+        interface OllamaChunk {
+          message?: { content?: string; thinking?: string };
+          done?: boolean;
+          done_reason?: string;
+          error?: string;
+          total_duration?: number;
+          load_duration?: number;
+          prompt_eval_count?: number;
+          eval_count?: number;
+          eval_duration?: number;
+        }
 
         const stream = new ReadableStream({
           async start(controller) {
-            const reader = ollamaResponse.body!.getReader();
+            const send = (obj: Record<string, unknown>) => {
+              try {
+                controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
+              } catch {
+                // client already gone
+              }
+            };
+
             let fullResponse = "";
             let buffer = "";
+            let final: OllamaChunk | null = null;
+            let streamError: string | null = null;
+            let malformedChunks = 0;
+            let firstTokenMs: number | null = null;
+            let lastHeartbeat = 0;
 
             try {
-              while (true) {
+              read: while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
+                resetIdleTimer();
 
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split("\n");
-                buffer = lines.pop() || "";
+                buffer = lines.pop() ?? "";
 
                 for (const line of lines) {
                   if (!line.trim()) continue;
+                  let json: OllamaChunk;
                   try {
-                    const json = JSON.parse(line);
-                    const chunk = json.message?.content || "";
+                    json = JSON.parse(line) as OllamaChunk;
+                  } catch {
+                    malformedChunks++;
+                    continue;
+                  }
 
-                    if (chunk) {
-                      fullResponse += chunk;
-                      const payload = JSON.stringify({ chunk, done: false, conversationId: conversation.id }) + "\n";
-                      controller.enqueue(encoder.encode(payload));
-                    }
+                  if (json.error) {
+                    streamError = String(json.error);
+                    break read;
+                  }
 
-                    if (json.done) {
-                      db.run(
-                        `INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)`,
-                        [conversation.id, "assistant", fullResponse]
-                      );
-                      const final = JSON.stringify({ chunk: "", done: true, conversationId: conversation.id }) + "\n";
-                      controller.enqueue(encoder.encode(final));
-                      controller.close();
-                      return;
-                    }
-                  } catch {}
+                  const chunk = json.message?.content ?? "";
+                  if (chunk) {
+                    if (firstTokenMs === null) firstTokenMs = Math.round(performance.now() - startedAt);
+                    fullResponse += chunk;
+                    send({ chunk, done: false, conversationId });
+                  } else if (json.message?.thinking && performance.now() - lastHeartbeat > 2000) {
+                    // Keep the connection alive and let the UI show progress while a thinking model reasons.
+                    lastHeartbeat = performance.now();
+                    send({ status: "thinking", done: false, conversationId });
+                  }
+
+                  if (json.done) {
+                    final = json;
+                    break read;
+                  }
                 }
               }
-
-              if (fullResponse) {
-                db.run(
-                  `INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)`,
-                  [conversation.id, "assistant", fullResponse]
-                );
-              }
-              const final = JSON.stringify({ chunk: "", done: true, conversationId: conversation.id }) + "\n";
-              controller.enqueue(encoder.encode(final));
-              controller.close();
             } catch (err) {
-              controller.error(err);
+              streamError = state.abortReason ?? (err as Error).message;
+            } finally {
+              state.finished = true;
+              clearTimers();
+              reader.cancel().catch(() => {});
             }
+
+            // Decide the outcome and mark incomplete replies honestly.
+            let outcome: "completed" | "truncated" | "empty" | "cancelled" | "timeout" | "failed";
+            let notice: string | null = null;
+            if (final && final.done_reason === "length") {
+              outcome = "truncated";
+              notice = "[Reply cut off: it reached the maximum length. Ask me to continue if you need more.]";
+            } else if (final && fullResponse.trim()) {
+              outcome = "completed";
+            } else if (final) {
+              outcome = "empty";
+              notice = "[The AI model returned an empty reply. Please try again.]";
+            } else if (state.abortReason === "client_cancelled") {
+              outcome = "cancelled";
+              notice = "[Reply stopped before it finished.]";
+            } else if (state.abortReason) {
+              outcome = "timeout";
+              notice = "[Reply interrupted: the AI model took too long to respond.]";
+            } else {
+              outcome = "failed";
+              notice = "[Reply interrupted: the AI model stopped unexpectedly. Please try again.]";
+            }
+
+            const saved = notice ? (fullResponse ? `${fullResponse}\n\n${notice}` : notice) : fullResponse;
+            try {
+              db.run(`INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)`, [conversationId, "assistant", saved]);
+            } catch (err) {
+              logEvent("chat_error", { stage: "save_reply", error: (err as Error).message });
+            }
+
+            if (notice) send({ chunk: (fullResponse ? "\n\n" : "") + notice, done: false, conversationId });
+            send({ chunk: "", done: true, conversationId, outcome });
+            try {
+              controller.close();
+            } catch {}
+
+            // Metrics: counts and timings only, never message content.
+            const latencyMs = Math.round(performance.now() - startedAt);
+            if (outcome === "completed" || outcome === "truncated") {
+              chatStats.completed++;
+              chatStats.totalLatencyMs += latencyMs;
+              chatStats.totalOutputTokens += final?.eval_count ?? 0;
+              if (outcome === "truncated") chatStats.truncated++;
+            } else if (outcome === "cancelled") chatStats.cancelled++;
+            else if (outcome === "timeout") chatStats.timedOut++;
+            else chatStats.failed++;
+
+            logEvent("chat", {
+              model: OLLAMA_MODEL,
+              outcome,
+              abortReason: state.abortReason,
+              error: outcome === "completed" ? undefined : streamError ?? undefined,
+              latencyMs,
+              timeToFirstTokenMs: firstTokenMs,
+              loadMs: final?.load_duration ? Math.round(final.load_duration / 1e6) : undefined,
+              promptTokens: final?.prompt_eval_count,
+              outputTokens: final?.eval_count,
+              tokensPerSecond:
+                final?.eval_count && final.eval_duration
+                  ? Math.round((final.eval_count / (final.eval_duration / 1e9)) * 10) / 10
+                  : undefined,
+              estimatedPromptTokens: built.estimatedPromptTokens,
+              historyTurnsUsed: built.historyTurnsUsed,
+              historyTurnsDropped: built.historyTurnsDropped,
+              attachments: attachments.length,
+              malformedChunks: malformedChunks || undefined,
+            });
+          },
+          cancel() {
+            // Browser closed the tab or navigated away: stop generating.
+            abortWith("client_cancelled");
           },
         });
 
@@ -717,7 +1099,8 @@ const server = Bun.serve({
           headers: { "Content-Type": "application/x-ndjson", "Cache-Control": "no-cache" },
         });
       } catch (error) {
-        console.error("Chat error:", error);
+        chatStats.failed++;
+        logEvent("chat_error", { stage: "handler", error: (error as Error).message });
         return Response.json({ error: "Something went wrong while generating the response." }, { status: 500 });
       }
     }
@@ -749,7 +1132,7 @@ const server = Bun.serve({
       }
 
       const messages = db
-        .query("SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC")
+        .query("SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC")
         .all(id) as { id: number; role: string; content: string; created_at: string }[];
 
       const attachments = db
@@ -785,23 +1168,14 @@ const server = Bun.serve({
         return Response.json({ error: "Conversation not found" }, { status: 404 });
       }
 
-      db.run("DELETE FROM messages WHERE conversation_id = ?", [id]);
-      db.run("DELETE FROM conversations WHERE id = ?", [id]);
+      // Removes messages, file records, extracted text and the uploaded files on disk.
+      await deleteConversations([id]);
 
       return Response.json({ success: true });
-    }
-
-    if (url.pathname === "/health") {
-      return Response.json({
-        status: "ok",
-        service: "Local AI Assistant",
-        model: "qwen2.5:3b",
-        database: "connected",
-      });
     }
 
     return new Response("Not Found", { status: 404 });
   },
 });
 
-console.log(`Local AI Assistant running at http://localhost:${server.port}`);
+logEvent("server_started", { url: `http://localhost:${server.port}`, model: OLLAMA_MODEL, ollamaUrl: LLM.url, numCtx: LLM.numCtx, numPredict: LLM.numPredict, retentionDays: RETENTION_DAYS });
