@@ -40,8 +40,49 @@
               </button>
             </div>
           </div>
+          <p class="forgot-link"><button type="button" id="showForgot">Forgot password?</button></p>
           <button type="submit" class="auth-submit">Sign in</button>
           <p class="auth-switch">Don't have an account? <button type="button" id="showRegister">Create one</button></p>
+        </form>
+
+        <!-- Forgot Password Form -->
+        <form id="forgotForm" class="auth-form hidden">
+          <h2>Reset your password</h2>
+          <p class="auth-help">Enter the email you signed up with and we'll send you a link to choose a new password.</p>
+          <div class="form-group">
+            <label for="forgotEmail">Email</label>
+            <input type="email" id="forgotEmail" name="email" required autocomplete="email" />
+          </div>
+          <button type="submit" class="auth-submit">Send reset link</button>
+          <p class="auth-switch">Remembered it? <button type="button" class="back-to-login">Back to sign in</button></p>
+        </form>
+
+        <!-- Choose New Password Form (opened from the emailed link) -->
+        <form id="resetForm" class="auth-form hidden">
+          <h2>Choose a new password</h2>
+          <div class="form-group">
+            <label for="resetPassword">New password</label>
+            <div class="password-field">
+              <input type="password" id="resetPassword" name="password" required minlength="8" autocomplete="new-password" />
+              <button type="button" class="password-toggle" data-target="resetPassword" title="Show password" aria-label="Show password">
+                <svg class="icon-eye" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                <svg class="icon-eye-off" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
+              </button>
+            </div>
+            <small>At least 8 characters</small>
+          </div>
+          <div class="form-group">
+            <label for="resetPasswordConfirm">Confirm new password</label>
+            <div class="password-field">
+              <input type="password" id="resetPasswordConfirm" name="passwordConfirm" required minlength="8" autocomplete="new-password" />
+              <button type="button" class="password-toggle" data-target="resetPasswordConfirm" title="Show password" aria-label="Show password">
+                <svg class="icon-eye" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                <svg class="icon-eye-off" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
+              </button>
+            </div>
+          </div>
+          <button type="submit" class="auth-submit">Reset password</button>
+          <p class="auth-switch"><button type="button" class="back-to-login">Back to sign in</button></p>
         </form>
 
         <!-- Register Form -->
@@ -124,17 +165,17 @@
       <div class="sidebar-footer">
 
         <div class="user-menu">
-          <div class="user-avatar" id="userAvatar"></div>
-          <div class="user-info">
-            <strong id="userName"></strong>
-            <small id="userEmail"></small>
-          </div>
+          <button id="profileBtn" class="profile-btn" type="button" title="View profile">
+            <div class="user-avatar" id="userAvatar"></div>
+            <div class="user-info">
+              <strong id="userName"></strong>
+              <small id="userEmail"></small>
+            </div>
+          </button>
           <button id="logoutBtn" class="logout-btn" title="Sign out">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
           </button>
         </div>
-
-        <button id="deleteAccountBtn" class="delete-account-link" type="button">Delete account</button>
 
       </div>
 
@@ -143,6 +184,110 @@
 
     <!-- Main -->
     <main class="chat">
+
+      <!-- Profile page -->
+      <section id="profileView" class="page hidden" aria-labelledby="profileTitle">
+        <header class="page-header">
+          <button type="button" class="page-back" data-back-to-chat title="Back to chat" aria-label="Back to chat">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+          </button>
+          <h2 id="profileTitle">Profile</h2>
+          <button type="button" id="openSettingsBtn" class="page-action">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+            Settings
+          </button>
+        </header>
+
+        <div class="page-body">
+          <div class="profile-card">
+            <div class="profile-avatar" id="profileAvatar"></div>
+            <div class="profile-identity">
+              <h3 id="profileName"></h3>
+              <p id="profileEmail"></p>
+              <span id="profileVerified" class="badge">Email verified</span>
+            </div>
+          </div>
+
+          <div class="stat-row">
+            <div class="stat"><strong id="statConversations">–</strong><span>Chats</span></div>
+            <div class="stat"><strong id="statMessages">–</strong><span>Messages sent</span></div>
+            <div class="stat"><strong id="statFiles">–</strong><span>Files shared</span></div>
+          </div>
+
+          <form id="profileForm" class="settings-card">
+            <h3>Your details</h3>
+            <div class="form-group">
+              <label for="profileNameInput">Display name</label>
+              <input type="text" id="profileNameInput" maxlength="80" autocomplete="name" />
+            </div>
+            <div class="form-group">
+              <label>Email</label>
+              <input type="email" id="profileEmailInput" disabled />
+              <small>Your email is used to sign in and can't be changed here.</small>
+            </div>
+            <div class="form-group">
+              <label>Member since</label>
+              <input type="text" id="profileJoined" disabled />
+            </div>
+            <div class="form-actions">
+              <span id="profileSaveStatus" class="save-status" role="status"></span>
+              <button type="submit" class="btn-primary">Save changes</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <!-- Settings page -->
+      <section id="settingsView" class="page hidden" aria-labelledby="settingsTitle">
+        <header class="page-header">
+          <button type="button" class="page-back" id="settingsBackBtn" title="Back to profile" aria-label="Back to profile">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+          </button>
+          <h2 id="settingsTitle">Settings</h2>
+        </header>
+
+        <div class="page-body">
+          <div class="settings-card">
+            <h3>Appearance</h3>
+            <div class="setting-row">
+              <div>
+                <strong>Dark mode</strong>
+                <p>Switch between light and dark themes.</p>
+              </div>
+              <button type="button" id="settingsThemeBtn" class="btn-secondary">Toggle theme</button>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <h3>Your data</h3>
+            <p class="setting-note" data-retention-full>
+              Your chats and uploaded files are stored on this ARISA server and sent to the ARISA AI model (Ollama) to generate replies.
+              <span data-retention>Chats are kept until you delete them.</span>
+            </p>
+          </div>
+
+          <div class="settings-card danger-zone">
+            <h3>Account</h3>
+            <div class="setting-row">
+              <div>
+                <strong>Deactivate account</strong>
+                <p>Signs you out everywhere and hides your account. Your chats and files are kept. Sign in again any time to reactivate.</p>
+              </div>
+              <button type="button" id="deactivateAccountBtn" class="btn-warning">Deactivate</button>
+            </div>
+            <div class="setting-row">
+              <div>
+                <strong>Delete account</strong>
+                <p>Permanently deletes your account, all your chats and every file you uploaded. This can't be undone.</p>
+              </div>
+              <button type="button" id="deleteAccountBtn" class="btn-danger">Delete account</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Chat view -->
+      <div id="chatView" class="chat-view">
 
       <!-- Chat header -->
 
@@ -272,26 +417,29 @@
 
       </section>
 
+      </div>
+
     </main>
 
   </div>
 
-  <dialog id="deleteAccountDialog" class="confirm-dialog">
-    <form id="deleteAccountForm" method="dialog">
-      <h3>Delete your account?</h3>
-      <p>This permanently deletes your account, all your chats and every file you uploaded. It can't be undone.</p>
-      <label for="deleteAccountPassword">Enter your password to confirm</label>
+  <!-- Password-confirmed account actions (deactivate / delete); text is set by script.js -->
+  <dialog id="accountDialog" class="confirm-dialog">
+    <form id="accountDialogForm" method="dialog">
+      <h3 id="accountDialogTitle"></h3>
+      <p id="accountDialogText"></p>
+      <label for="accountDialogPassword">Enter your password to confirm</label>
       <div class="password-field">
-        <input type="password" id="deleteAccountPassword" required autocomplete="current-password" />
-        <button type="button" class="password-toggle" data-target="deleteAccountPassword" title="Show password" aria-label="Show password">
+        <input type="password" id="accountDialogPassword" required autocomplete="current-password" />
+        <button type="button" class="password-toggle" data-target="accountDialogPassword" title="Show password" aria-label="Show password">
           <svg class="icon-eye" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
           <svg class="icon-eye-off" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
         </button>
       </div>
-      <p id="deleteAccountError" class="dialog-error" role="alert"></p>
+      <p id="accountDialogError" class="dialog-error" role="alert"></p>
       <div class="toast-actions">
-        <button type="button" id="deleteAccountCancel" class="toast-cancel">Cancel</button>
-        <button type="submit" class="toast-confirm">Delete account</button>
+        <button type="button" id="accountDialogCancel" class="toast-cancel">Cancel</button>
+        <button type="submit" id="accountDialogConfirm" class="toast-confirm"></button>
       </div>
     </form>
   </dialog>

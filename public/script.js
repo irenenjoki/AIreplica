@@ -144,10 +144,23 @@ async function login(email, password) {
     return false;
   }
   updateUserUI(data.user);
+  showView("chat");
   showApp();
+  if (data.reactivated) showToast("Welcome back! Your account has been reactivated.");
   await loadActiveConversation();
   loadConversations();
   return true;
+}
+
+function showToast(message) {
+  document.querySelector(".info-toast")?.remove();
+  const toast = document.createElement("div");
+  toast.className = "delete-toast info-toast";
+  toast.setAttribute("role", "status");
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add("show"));
+  setTimeout(() => toast.remove(), 5000);
 }
 
 async function register(name, email, password) {
@@ -179,6 +192,7 @@ async function logout() {
   activeConversationTitle = null;
   saveActiveConversation();
   showWelcome();
+  showView("chat");
   showAuthScreen();
 }
 
@@ -202,16 +216,87 @@ function showWelcome() {
 // AUTH FORM HANDLERS
 // ============================
 
-showRegister.addEventListener("click", () => {
-  loginForm.classList.add("hidden");
-  registerForm.classList.remove("hidden");
+const forgotForm = document.getElementById("forgotForm");
+const resetForm = document.getElementById("resetForm");
+const AUTH_FORMS = { login: loginForm, register: registerForm, forgot: forgotForm, reset: resetForm };
+
+function showAuthForm(name) {
+  for (const [key, form] of Object.entries(AUTH_FORMS)) {
+    form.classList.toggle("hidden", key !== name);
+  }
   hideAuthError();
+  AUTH_FORMS[name].querySelector("input")?.focus();
+}
+
+showRegister.addEventListener("click", () => showAuthForm("register"));
+showLogin.addEventListener("click", () => showAuthForm("login"));
+document.getElementById("showForgot").addEventListener("click", () => {
+  const typed = document.getElementById("loginEmail").value.trim();
+  showAuthForm("forgot");
+  if (typed) document.getElementById("forgotEmail").value = typed;
+});
+document.querySelectorAll(".back-to-login").forEach((btn) => {
+  btn.addEventListener("click", () => showAuthForm("login"));
 });
 
-showLogin.addEventListener("click", () => {
-  registerForm.classList.add("hidden");
-  loginForm.classList.remove("hidden");
+forgotForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
   hideAuthError();
+  const email = document.getElementById("forgotEmail").value.trim();
+  const submitBtn = forgotForm.querySelector(".auth-submit");
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Sending...";
+  try {
+    const response = await fetch("/api/auth/forgot-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "Couldn't send the reset email.");
+    showAuthSuccess(data.message);
+  } catch (error) {
+    showAuthError(error.message);
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Send reset link";
+  }
+});
+
+// The token from the emailed link (?reset=...). It's removed from the address
+// bar straight away so it doesn't stay in browser history.
+let resetToken = null;
+
+resetForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  hideAuthError();
+  const password = document.getElementById("resetPassword").value;
+  const confirm = document.getElementById("resetPasswordConfirm").value;
+  if (password !== confirm) {
+    showAuthError("The two passwords don't match.");
+    return;
+  }
+  const submitBtn = resetForm.querySelector(".auth-submit");
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Resetting...";
+  try {
+    const response = await fetch("/api/auth/reset-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: resetToken, password })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "Couldn't reset your password.");
+    resetToken = null;
+    resetForm.reset();
+    showAuthForm("login");
+    showAuthSuccess(data.message);
+  } catch (error) {
+    showAuthError(error.message);
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Reset password";
+  }
 });
 
 loginForm.addEventListener("submit", async (e) => {
@@ -408,6 +493,7 @@ function markActiveConversationInList() {
 
 async function loadConversation(id) {
   if (id !== activeConversationId) stopGenerating();
+  showView("chat");
   try {
     const response = await fetch(`/api/conversations/${id}`);
     const data = await response.json();
@@ -684,6 +770,7 @@ function stopGenerating() {
 
 newChatBtn.addEventListener("click", () => {
   stopGenerating();
+  showView("chat");
   activeConversationId = null;
   activeConversationTitle = null;
   saveActiveConversation();
@@ -695,59 +782,213 @@ newChatBtn.addEventListener("click", () => {
 
 
 // ============================
-// DELETE ACCOUNT
+// VIEWS (chat / profile / settings)
 // ============================
 
-const deleteAccountBtn = document.getElementById("deleteAccountBtn");
-const deleteAccountDialog = document.getElementById("deleteAccountDialog");
-const deleteAccountForm = document.getElementById("deleteAccountForm");
-const deleteAccountPassword = document.getElementById("deleteAccountPassword");
-const deleteAccountError = document.getElementById("deleteAccountError");
+const chatView = document.getElementById("chatView");
+const profileView = document.getElementById("profileView");
+const settingsView = document.getElementById("settingsView");
+const profileBtn = document.getElementById("profileBtn");
 
-deleteAccountBtn.addEventListener("click", () => {
-  deleteAccountForm.reset();
-  // Always open with the password hidden, even if it was shown last time.
-  deleteAccountPassword.type = "password";
-  const toggle = deleteAccountForm.querySelector(".password-toggle");
-  toggle.classList.remove("showing");
-  toggle.title = "Show password";
-  toggle.setAttribute("aria-label", "Show password");
-  deleteAccountError.textContent = "";
-  deleteAccountDialog.showModal();
-  deleteAccountPassword.focus();
+function showView(name) {
+  chatView.classList.toggle("hidden", name !== "chat");
+  profileView.classList.toggle("hidden", name !== "profile");
+  settingsView.classList.toggle("hidden", name !== "settings");
+  profileBtn.classList.toggle("active", name === "profile" || name === "settings");
+  if (name === "chat") messageInput.focus();
+}
+
+profileBtn.addEventListener("click", () => {
+  showView("profile");
+  loadProfile();
 });
 
-document.getElementById("deleteAccountCancel").addEventListener("click", () => deleteAccountDialog.close());
+document.querySelectorAll("[data-back-to-chat]").forEach((btn) => {
+  btn.addEventListener("click", () => showView("chat"));
+});
 
-deleteAccountForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  deleteAccountError.textContent = "";
-  const submit = deleteAccountForm.querySelector(".toast-confirm");
-  submit.disabled = true;
+document.getElementById("openSettingsBtn").addEventListener("click", () => {
+  showView("settings");
+  settingsView.querySelector(".page-body").scrollTop = 0;
+});
+document.getElementById("settingsBackBtn").addEventListener("click", () => showView("profile"));
+
+
+// ============================
+// PROFILE
+// ============================
+
+const profileForm = document.getElementById("profileForm");
+const profileNameInput = document.getElementById("profileNameInput");
+const profileSaveStatus = document.getElementById("profileSaveStatus");
+
+function formatJoined(sqliteDate) {
+  // SQLite CURRENT_TIMESTAMP is UTC without a zone marker.
+  const date = new Date(sqliteDate.replace(" ", "T") + "Z");
+  return isNaN(date) ? sqliteDate : date.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+}
+
+function renderProfileHeader(name, email) {
+  document.getElementById("profileAvatar").textContent = (name || email).charAt(0).toUpperCase();
+  document.getElementById("profileName").textContent = name || "No display name";
+  document.getElementById("profileEmail").textContent = email;
+}
+
+async function loadProfile() {
+  profileView.querySelector(".page-body").scrollTop = 0;
+  profileSaveStatus.textContent = "";
+  profileSaveStatus.classList.remove("error");
+  if (currentUser) {
+    renderProfileHeader(currentUser.name, currentUser.email);
+    // Show what we already know while the full profile loads.
+    profileNameInput.value = currentUser.name || "";
+    document.getElementById("profileEmailInput").value = currentUser.email;
+  }
   try {
-    const response = await fetch("/api/account", {
-      method: "DELETE",
+    const response = await fetch("/api/profile");
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(data.error || "Couldn't load your profile. Please try again in a moment.");
+    }
+    const p = data.profile;
+    renderProfileHeader(p.name, p.email);
+    document.getElementById("profileVerified").classList.toggle("hidden", !p.email_verified);
+    profileNameInput.value = p.name || "";
+    document.getElementById("profileEmailInput").value = p.email;
+    document.getElementById("profileJoined").value = formatJoined(p.created_at);
+    document.getElementById("statConversations").textContent = p.stats.conversations.toLocaleString();
+    document.getElementById("statMessages").textContent = p.stats.messages.toLocaleString();
+    document.getElementById("statFiles").textContent = p.stats.files.toLocaleString();
+  } catch (error) {
+    profileSaveStatus.textContent = error.message;
+    profileSaveStatus.classList.add("error");
+  }
+}
+
+profileForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const submit = profileForm.querySelector("button[type=submit]");
+  submit.disabled = true;
+  profileSaveStatus.classList.remove("error");
+  profileSaveStatus.textContent = "Saving…";
+  try {
+    const response = await fetch("/api/profile", {
+      method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password: deleteAccountPassword.value })
+      body: JSON.stringify({ name: profileNameInput.value })
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || "Could not delete account");
-    deleteAccountDialog.close();
-    stopGenerating();
-    currentUser = null;
-    activeConversationId = null;
-    activeConversationTitle = null;
-    saveActiveConversation();
-    conversationList.innerHTML = "";
-    showWelcome();
-    showAuthScreen();
-    showAuthSuccess("Your account and all of its chats and files have been deleted.");
+    if (!response.ok) throw new Error(data.error || "Could not save changes");
+    updateUserUI({ ...currentUser, name: data.user.name });
+    renderProfileHeader(data.user.name, currentUser.email);
+    profileSaveStatus.textContent = "Saved";
   } catch (error) {
-    deleteAccountError.textContent = error.message;
+    profileSaveStatus.textContent = error.message;
+    profileSaveStatus.classList.add("error");
   } finally {
     submit.disabled = false;
   }
 });
+
+
+// ============================
+// SETTINGS
+// ============================
+
+document.getElementById("settingsThemeBtn").addEventListener("click", () => themeToggle.click());
+
+
+// ============================
+// ACCOUNT ACTIONS (deactivate / delete), confirmed with the password
+// ============================
+
+const accountDialog = document.getElementById("accountDialog");
+const accountDialogForm = document.getElementById("accountDialogForm");
+const accountDialogPassword = document.getElementById("accountDialogPassword");
+const accountDialogError = document.getElementById("accountDialogError");
+const accountDialogConfirm = document.getElementById("accountDialogConfirm");
+
+const ACCOUNT_ACTIONS = {
+  deactivate: {
+    title: "Deactivate your account?",
+    text: "You'll be signed out on every device and your account will be hidden. Your chats and files are kept. Sign in again any time to reactivate it.",
+    confirm: "Deactivate",
+    request: (password) => fetch("/api/account/deactivate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password })
+    }),
+    done: "Your account has been deactivated. Sign in again any time to reactivate it."
+  },
+  delete: {
+    title: "Delete your account?",
+    text: "This permanently deletes your account, all your chats and every file you uploaded. It can't be undone.",
+    confirm: "Delete account",
+    request: (password) => fetch("/api/account", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password })
+    }),
+    done: "Your account and all of its chats and files have been deleted."
+  }
+};
+
+let pendingAccountAction = null;
+
+function openAccountDialog(actionName) {
+  const action = ACCOUNT_ACTIONS[actionName];
+  pendingAccountAction = action;
+  accountDialogForm.reset();
+  accountDialogError.textContent = "";
+  document.getElementById("accountDialogTitle").textContent = action.title;
+  document.getElementById("accountDialogText").textContent = action.text;
+  accountDialogConfirm.textContent = action.confirm;
+  // Always open with the password hidden, even if it was shown last time.
+  accountDialogPassword.type = "password";
+  const toggle = accountDialogForm.querySelector(".password-toggle");
+  toggle.classList.remove("showing");
+  toggle.title = "Show password";
+  toggle.setAttribute("aria-label", "Show password");
+  accountDialog.showModal();
+  accountDialogPassword.focus();
+}
+
+document.getElementById("deactivateAccountBtn").addEventListener("click", () => openAccountDialog("deactivate"));
+document.getElementById("deleteAccountBtn").addEventListener("click", () => openAccountDialog("delete"));
+document.getElementById("accountDialogCancel").addEventListener("click", () => accountDialog.close());
+
+accountDialogForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!pendingAccountAction) return;
+  const action = pendingAccountAction;
+  accountDialogError.textContent = "";
+  accountDialogConfirm.disabled = true;
+  try {
+    const response = await action.request(accountDialogPassword.value);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "Something went wrong");
+    accountDialog.close();
+    signedOutLocally();
+    showAuthSuccess(action.done);
+  } catch (error) {
+    accountDialogError.textContent = error.message;
+  } finally {
+    accountDialogConfirm.disabled = false;
+  }
+});
+
+// Reset the app to the signed-out state (the server has already ended the session).
+function signedOutLocally() {
+  stopGenerating();
+  currentUser = null;
+  activeConversationId = null;
+  activeConversationTitle = null;
+  saveActiveConversation();
+  conversationList.innerHTML = "";
+  showWelcome();
+  showView("chat");
+  showAuthScreen();
+}
 
 
 // ============================
@@ -783,4 +1024,15 @@ sendBtn.addEventListener("click", () => {
 // INIT
 // ============================
 
-checkAuth();
+(function init() {
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("reset");
+  if (token) {
+    resetToken = token;
+    history.replaceState(null, "", window.location.pathname);
+    showAuthScreen();
+    showAuthForm("reset");
+    return;
+  }
+  checkAuth();
+})();

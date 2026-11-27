@@ -79,6 +79,25 @@ export function initSchema(db: Database): void {
     db.run(`ALTER TABLE files ADD COLUMN message_id INTEGER REFERENCES messages(id)`);
   }
 
+  // Password reset links. Only a SHA-256 hash of each token is stored.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS password_resets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      token_hash TEXT UNIQUE NOT NULL,
+      expires_at DATETIME NOT NULL,
+      used_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+  `);
+
+  // Migration: account deactivation (NULL = active). Signing in again reactivates.
+  const userColumns = db.query(`PRAGMA table_info(users)`).all() as { name: string }[];
+  if (!userColumns.some((c) => c.name === "deactivated_at")) {
+    db.run(`ALTER TABLE users ADD COLUMN deactivated_at DATETIME`);
+  }
+
   db.run(`CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_files_conversation ON files(conversation_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id)`);

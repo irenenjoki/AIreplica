@@ -4,7 +4,8 @@ A self-hosted AI chat assistant powered by [Ollama](https://ollama.com) (`qwen2.
 
 ## Features
 
-- **Auth** — register, login, logout, bcrypt password hashing, 30-day sessions
+- **Auth** — register, login, logout, password reset by email, bcrypt password hashing, 30-day sessions
+- **Profile & settings** — edit display name, deactivate (sign in again to reactivate) or permanently delete the account
 - **Email verification** — SMTP verification tokens (Ethereal for testing, real SMTP for production)
 - **Chat** — streaming responses via Ollama with timeouts, Stop button and context-window budgeting; history persisted in SQLite
 - **File attachments** — PDF, DOCX, and text files extracted and injected into chat context (5 MB cap)
@@ -38,6 +39,7 @@ Copy `.env.example` to `.env` and fill it in. Every setting is described in that
 | `OLLAMA_NUM_PREDICT` | `1024` | Longest reply, in tokens. Longer replies are cut off and marked as such. |
 | `OLLAMA_FIRST_BYTE_TIMEOUT_MS` / `OLLAMA_IDLE_TIMEOUT_MS` / `OLLAMA_TOTAL_TIMEOUT_MS` | 120 s / 60 s / 300 s | When to give up on a slow or stuck model. |
 | `RETENTION_DAYS` | `0` (keep) | Delete conversations this many days after their last message. |
+| `APP_URL` | — | Public address used in emailed links, e.g. `https://arisa.example.com`. **Set it in production.** |
 | `TRUST_PROXY` | `false` | Set `true` only behind your own reverse proxy (uses `X-Forwarded-For` for rate limits). |
 
 > **Security:** never commit `.env` or the database. `.env`, `*.sqlite` and `uploads/` are gitignored. The session cookie uses the `Secure` attribute, so HTTPS is required in production.
@@ -112,6 +114,5 @@ The SQLite database (`emailai.sqlite`, or `DB_PATH`) and its tables are created 
 
 ## Known limitations / next steps
 
-- Password reset flow
 - Richer production deployment docs (reverse proxy, TLS, backups)
 - Rate limits are in memory and reset when the server restarts

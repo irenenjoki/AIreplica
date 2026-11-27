@@ -207,7 +207,7 @@ function createVerificationToken(userId: number): string {
 
 function verifyToken(token: string): { user_id: number } | null {
   const verification = db
-    .query(`SELECT user_id FROM email_verifications WHERE token = ? AND expires_at > datetime('now')`)
+    .query(`SELECT user_id FROM email_verifications WHERE token = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`)
     .get(token) as { user_id: number } | undefined;
 
   if (!verification) return null;
@@ -222,7 +222,7 @@ function markEmailVerified(userId: number): void {
 
 function getUserFromSession(sessionId: string): { id: number; email: string; name: string | null; email_verified: number } | null {
   const session = db
-    .query(`SELECT s.user_id, u.email, u.name, u.email_verified FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = ? AND s.expires_at > datetime('now')`)
+    .query(`SELECT s.user_id, u.email, u.name, u.email_verified FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = ? AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AND u.deactivated_at IS NULL`)
     .get(sessionId) as { user_id: number; email: string; name: string | null; email_verified: number } | undefined;
 
   if (!session) return null;
@@ -235,8 +235,9 @@ function deleteSession(sessionId: string): void {
 }
 
 function cleanupExpiredSessions(): void {
-  db.run(`DELETE FROM sessions WHERE expires_at <= datetime('now')`);
-  db.run(`DELETE FROM email_verifications WHERE expires_at <= datetime('now')`);
+  db.run(`DELETE FROM sessions WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`);
+  db.run(`DELETE FROM email_verifications WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`);
+  db.run(`DELETE FROM password_resets WHERE used_at IS NOT NULL OR expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`);
 }
 
 cleanupExpiredSessions();
@@ -266,13 +267,18 @@ const CHAT_RATE_LIMIT_MAX = 20;
 const UPLOAD_RATE_LIMIT_MAX = 20;
 const rateLimitHits = new Map<string, { count: number; resetAt: number }>();
 
-function rateLimit(key: string, route: string, max = RATE_LIMIT_MAX): { ok: boolean; remaining: number } {
+function rateLimit(
+  key: string,
+  route: string,
+  max = RATE_LIMIT_MAX,
+  windowMs = RATE_LIMIT_WINDOW_MS
+): { ok: boolean; remaining: number } {
   const bucket = `${key}:${route}`;
   const now = Date.now();
   let entry = rateLimitHits.get(bucket);
 
   if (!entry || now > entry.resetAt) {
-    entry = { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    entry = { count: 1, resetAt: now + windowMs };
     rateLimitHits.set(bucket, entry);
     return { ok: true, remaining: max - 1 };
   }
@@ -340,9 +346,29 @@ async function extractFileText(buffer: Buffer, filename: string, mimeType: strin
   throw new Error("Unsupported file type");
 }
 
-async function sendVerificationEmail(email: string, token: string, origin: string): Promise<void> {
-  const verificationUrl = `${origin}/api/auth/verify-email?token=${token}`;
-  
+/**
+ * Base URL used in emailed links. Set APP_URL in production: without it the
+ * link uses the request's Host header, which an attacker can forge to make a
+ * password-reset email point at their own site.
+ */
+function appBaseUrl(requestOrigin: string): string {
+  return (process.env.APP_URL?.trim() || requestOrigin).replace(/\/+$/, "");
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+async function sendActionEmail(opts: {
+  to: string;
+  subject: string;
+  heading: string;
+  intro: string;
+  buttonText: string;
+  actionUrl: string;
+  footer: string;
+}): Promise<void> {
+  const url = escapeHtml(opts.actionUrl);
   const html = `
     <!DOCTYPE html>
     <html>
@@ -353,37 +379,97 @@ async function sendVerificationEmail(email: string, token: string, origin: strin
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #1f2937; max-width: 600px; margin: 0 auto; padding: 20px;">
       <div style="background: linear-gradient(135deg, #15803d 0%, #166534 100%); padding: 30px; border-radius: 16px 16px 0 0; text-align: center;">
         <div style="width: 56px; height: 56px; border-radius: 16px; background: white; color: #15803d; display: inline-flex; align-items: center; justify-content: center; font-size: 28px; font-weight: bold;">✦</div>
-        <h1 style="color: white; margin: 16px 0 0; font-size: 24px;">Local AI</h1>
+        <h1 style="color: white; margin: 16px 0 0; font-size: 24px;">Arisa Assistant</h1>
       </div>
       <div style="background: #f9fafb; padding: 30px; border-radius: 0 0 16px 16px; border: 1px solid #e5e7eb; border-top: none;">
-        <h2 style="margin: 0 0 16px; font-size: 20px;">Verify your email</h2>
-        <p style="margin: 0 0 24px; color: #4b5563;">Thanks for signing up! Please verify your email address to activate your account.</p>
+        <h2 style="margin: 0 0 16px; font-size: 20px;">${escapeHtml(opts.heading)}</h2>
+        <p style="margin: 0 0 24px; color: #4b5563;">${escapeHtml(opts.intro)}</p>
         <div style="text-align: center; margin: 32px 0;">
-          <a href="${verificationUrl}" style="display: inline-block; background: #15803d; color: white; padding: 14px 28px; border-radius: 10px; text-decoration: none; font-weight: 600; font-size: 16px;">Verify Email Address</a>
+          <a href="${url}" style="display: inline-block; background: #15803d; color: white; padding: 14px 28px; border-radius: 10px; text-decoration: none; font-weight: 600; font-size: 16px;">${escapeHtml(opts.buttonText)}</a>
         </div>
-        <p style="margin: 24px 0 0; font-size: 13px; color: #6b7280;">Or copy this link:<br><a href="${verificationUrl}" style="color: #15803d; word-break: break-all;">${verificationUrl}</a></p>
+        <p style="margin: 24px 0 0; font-size: 13px; color: #6b7280;">Or copy this link:<br><a href="${url}" style="color: #15803d; word-break: break-all;">${url}</a></p>
         <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 24px 0;">
-        <p style="margin: 0; font-size: 12px; color: #9ca3af;">This link expires in ${VERIFICATION_TOKEN_HOURS} hours. If you didn't create an account, you can ignore this email.</p>
+        <p style="margin: 0; font-size: 12px; color: #9ca3af;">${escapeHtml(opts.footer)}</p>
       </div>
     </body>
     </html>
   `;
 
   const transporter = await getTransporter();
-  
+
   if (!transporter) {
-    console.log("=== VERIFICATION EMAIL (SMTP not configured) ===");
-    console.log(`To: ${email}`);
-    console.log(`Verification URL: ${verificationUrl}`);
+    console.log(`=== EMAIL (SMTP not configured): ${opts.subject} ===`);
+    console.log(`To: ${opts.to}`);
+    console.log(`Link: ${opts.actionUrl}`);
     console.log("=============================================");
     return;
   }
 
   await transporter.sendMail({
-    from: `"Local AI" <${EMAIL_CONFIG.auth.user}>`,
-    to: email,
-    subject: "Verify your Local AI account",
+    from: `"Arisa Assistant" <${EMAIL_CONFIG.auth.user}>`,
+    to: opts.to,
+    subject: opts.subject,
     html,
+  });
+}
+
+async function sendVerificationEmail(email: string, token: string, origin: string): Promise<void> {
+  await sendActionEmail({
+    to: email,
+    subject: "Verify your Arisa Assistant account",
+    heading: "Verify your email",
+    intro: "Thanks for signing up! Please verify your email address to activate your account.",
+    buttonText: "Verify Email Address",
+    actionUrl: `${appBaseUrl(origin)}/api/auth/verify-email?token=${encodeURIComponent(token)}`,
+    footer: `This link expires in ${VERIFICATION_TOKEN_HOURS} hours. If you didn't create an account, you can ignore this email.`,
+  });
+}
+
+// =========================
+// PASSWORD RESET
+// =========================
+
+const PASSWORD_RESET_MINUTES = 60;
+
+/** Only a hash of the reset token is stored, so a leaked database can't be used to reset passwords. */
+function hashResetToken(token: string): string {
+  return new Bun.CryptoHasher("sha256").update(token).digest("hex");
+}
+
+function createPasswordResetToken(userId: number): string {
+  const token = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
+  const expiresAt = new Date(Date.now() + PASSWORD_RESET_MINUTES * 60 * 1000);
+  db.transaction(() => {
+    // Only the newest link works.
+    db.run(`DELETE FROM password_resets WHERE user_id = ?`, [userId]);
+    db.run(`INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES (?, ?, ?)`, [
+      userId,
+      hashResetToken(token),
+      expiresAt.toISOString(),
+    ]);
+  })();
+  return token;
+}
+
+function findValidPasswordReset(token: string): { id: number; user_id: number } | null {
+  const row = db
+    .query(
+      `SELECT id, user_id FROM password_resets
+       WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?`
+    )
+    .get(hashResetToken(token), new Date().toISOString()) as { id: number; user_id: number } | undefined;
+  return row ?? null;
+}
+
+async function sendPasswordResetEmail(email: string, token: string, origin: string): Promise<void> {
+  await sendActionEmail({
+    to: email,
+    subject: "Reset your Arisa Assistant password",
+    heading: "Reset your password",
+    intro: "We received a request to reset your password. Click the button below to choose a new one.",
+    buttonText: "Reset Password",
+    actionUrl: `${appBaseUrl(origin)}/?reset=${encodeURIComponent(token)}`,
+    footer: `This link expires in ${PASSWORD_RESET_MINUTES} minutes and can be used once. If you didn't ask to reset your password, you can ignore this email; your password won't change.`,
   });
 }
 
@@ -457,8 +543,8 @@ const server = Bun.serve({
         }
 
         const user = db
-          .query(`SELECT id, email, password_hash, name, email_verified FROM users WHERE email = ?`)
-          .get(email) as { id: number; email: string; password_hash: string; name: string | null; email_verified: number } | undefined;
+          .query(`SELECT id, email, password_hash, name, email_verified, deactivated_at FROM users WHERE email = ?`)
+          .get(email) as { id: number; email: string; password_hash: string; name: string | null; email_verified: number; deactivated_at: string | null } | undefined;
 
         if (!user || !(await verifyPassword(password, user.password_hash))) {
           return Response.json({ error: "Invalid email or password" }, { status: 401 });
@@ -468,10 +554,18 @@ const server = Bun.serve({
           return Response.json({ error: "Please verify your email before logging in. Check your inbox for the verification link." }, { status: 401 });
         }
 
+        // Signing in to a deactivated account reactivates it.
+        const reactivated = Boolean(user.deactivated_at);
+        if (reactivated) {
+          db.run(`UPDATE users SET deactivated_at = NULL WHERE id = ?`, [user.id]);
+          logEvent("account_reactivated", {});
+        }
+
         const sessionId = createSession(user.id);
 
         return Response.json({
           user: { id: user.id, email: user.email, name: user.name, email_verified: 1 },
+          reactivated,
         }, {
           headers: { "Set-Cookie": setSessionCookie(sessionId) }
         });
@@ -558,6 +652,85 @@ const server = Bun.serve({
     }
 
     // =========================
+    // PASSWORD RESET
+    // =========================
+
+    if (url.pathname === "/api/auth/forgot-password" && req.method === "POST") {
+      if (!rateLimit(clientIp(req, server), "forgot-password", 5).ok) {
+        return Response.json({ error: "Too many requests. Try again later." }, { status: 429 });
+      }
+
+      // Same reply whether or not the email has an account, so the form can't
+      // be used to find out who is registered.
+      const genericReply = Response.json({
+        success: true,
+        message: "If an account exists for that email, we've sent a link to reset the password. It expires in 60 minutes.",
+      });
+
+      try {
+        const body = (await req.json().catch(() => ({}))) as { email?: unknown };
+        const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+        if (!email || !email.includes("@")) {
+          return Response.json({ error: "Please enter your email address." }, { status: 400 });
+        }
+
+        // At most 3 reset emails per address per hour, to stop inbox flooding.
+        if (!rateLimit(email, "forgot-password-email", 3, 60 * 60 * 1000).ok) {
+          return genericReply;
+        }
+
+        const user = db.query(`SELECT id, email FROM users WHERE email = ?`).get(email) as { id: number; email: string } | undefined;
+        if (user) {
+          const token = createPasswordResetToken(user.id);
+          await sendPasswordResetEmail(user.email, token, url.origin);
+          logEvent("password_reset_requested", {});
+        }
+        return genericReply;
+      } catch (error) {
+        logEvent("password_reset_error", { stage: "request", error: (error as Error).message });
+        return Response.json({ error: "Couldn't send the reset email. Please try again later." }, { status: 500 });
+      }
+    }
+
+    if (url.pathname === "/api/auth/reset-password" && req.method === "POST") {
+      if (!rateLimit(clientIp(req, server), "reset-password").ok) {
+        return Response.json({ error: "Too many requests. Try again later." }, { status: 429 });
+      }
+      try {
+        const body = (await req.json().catch(() => ({}))) as { token?: unknown; password?: unknown };
+        const token = typeof body.token === "string" ? body.token : "";
+        const password = typeof body.password === "string" ? body.password : "";
+
+        if (password.length < 8) {
+          return Response.json({ error: "Password must be at least 8 characters" }, { status: 400 });
+        }
+
+        const reset = token ? findValidPasswordReset(token) : null;
+        if (!reset) {
+          return Response.json(
+            { error: "This reset link is invalid or has expired. Please request a new one." },
+            { status: 400 }
+          );
+        }
+
+        const passwordHash = await hashPassword(password);
+        db.transaction(() => {
+          db.run(`UPDATE users SET password_hash = ?, email_verified = 1 WHERE id = ?`, [passwordHash, reset.user_id]);
+          db.run(`UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE id = ?`, [reset.id]);
+          db.run(`DELETE FROM password_resets WHERE user_id = ? AND id != ?`, [reset.user_id, reset.id]);
+          // Sign out everywhere: anyone using the old password loses access.
+          db.run(`DELETE FROM sessions WHERE user_id = ?`, [reset.user_id]);
+        })();
+
+        logEvent("password_reset_completed", {});
+        return Response.json({ success: true, message: "Your password has been reset. You can now sign in with your new password." });
+      } catch (error) {
+        logEvent("password_reset_error", { stage: "reset", error: (error as Error).message });
+        return Response.json({ error: "Couldn't reset your password. Please try again." }, { status: 500 });
+      }
+    }
+
+    // =========================
     // SERVE FRONTEND
     // =========================
 
@@ -565,7 +738,7 @@ const server = Bun.serve({
       return new Response(
         await Bun.file("./public/index.html").text(),
         {
-          headers: { "Content-Type": "text/html" },
+          headers: { "Content-Type": "text/html", "Cache-Control": "no-cache" },
         }
       );
     }
@@ -573,14 +746,14 @@ const server = Bun.serve({
     if (url.pathname === "/style.css" && req.method === "GET") {
       return new Response(
         await Bun.file("./public/style.css").text(),
-        { headers: { "Content-Type": "text/css" } }
+        { headers: { "Content-Type": "text/css", "Cache-Control": "no-cache" } }
       );
     }
 
     if (url.pathname === "/script.js" && req.method === "GET") {
       return new Response(
         await Bun.file("./public/script.js").text(),
-        { headers: { "Content-Type": "application/javascript" } }
+        { headers: { "Content-Type": "application/javascript", "Cache-Control": "no-cache" } }
       );
     }
 
@@ -648,6 +821,64 @@ const server = Bun.serve({
     const user = auth;
 
     // =========================
+    // PROFILE
+    // =========================
+
+    if (url.pathname === "/api/profile" && req.method === "GET") {
+      const profile = db
+        .query(`SELECT id, email, name, email_verified, created_at FROM users WHERE id = ?`)
+        .get(user.id) as { id: number; email: string; name: string | null; email_verified: number; created_at: string } | undefined;
+      if (!profile) return Response.json({ error: "Account not found" }, { status: 404 });
+
+      const stats = db
+        .query(
+          `SELECT
+             (SELECT COUNT(*) FROM conversations WHERE user_id = ?) AS conversations,
+             (SELECT COUNT(*) FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                WHERE c.user_id = ? AND m.role = 'user') AS messages,
+             (SELECT COUNT(*) FROM files WHERE user_id = ? AND message_id IS NOT NULL) AS files`
+        )
+        .get(user.id, user.id, user.id) as { conversations: number; messages: number; files: number };
+
+      return Response.json({ profile: { ...profile, stats } });
+    }
+
+    if (url.pathname === "/api/profile" && req.method === "PATCH") {
+      const body = (await req.json().catch(() => ({}))) as { name?: unknown };
+      if (typeof body.name !== "string") {
+        return Response.json({ error: "Name is required" }, { status: 400 });
+      }
+      const name = body.name.trim();
+      if (name.length > 80) {
+        return Response.json({ error: "Name must be 80 characters or fewer" }, { status: 400 });
+      }
+      db.run(`UPDATE users SET name = ? WHERE id = ?`, [name || null, user.id]);
+      return Response.json({ user: { ...user, name: name || null } });
+    }
+
+    // =========================
+    // DEACTIVATE ACCOUNT (data kept; signing in again reactivates)
+    // =========================
+
+    if (url.pathname === "/api/account/deactivate" && req.method === "POST") {
+      const limit = rateLimit(clientIp(req, server), "deactivate-account");
+      if (!limit.ok) {
+        return Response.json({ error: "Too many requests. Try again later." }, { status: 429 });
+      }
+      const body = (await req.json().catch(() => ({}))) as { password?: string };
+      const row = db.query(`SELECT password_hash FROM users WHERE id = ?`).get(user.id) as { password_hash: string } | undefined;
+      if (!row || !body.password || !(await verifyPassword(body.password, row.password_hash))) {
+        return Response.json({ error: "Incorrect password" }, { status: 401 });
+      }
+      db.transaction(() => {
+        db.run(`UPDATE users SET deactivated_at = CURRENT_TIMESTAMP WHERE id = ?`, [user.id]);
+        db.run(`DELETE FROM sessions WHERE user_id = ?`, [user.id]); // sign out everywhere
+      })();
+      logEvent("account_deactivated", {});
+      return Response.json({ success: true }, { headers: { "Set-Cookie": clearSessionCookie() } });
+    }
+
+    // =========================
     // DELETE ACCOUNT (and all of the user's data)
     // =========================
 
@@ -671,6 +902,7 @@ const server = Bun.serve({
           db.run(`DELETE FROM files WHERE user_id = ?`, [user.id]);
           db.run(`DELETE FROM sessions WHERE user_id = ?`, [user.id]);
           db.run(`DELETE FROM email_verifications WHERE user_id = ?`, [user.id]);
+          db.run(`DELETE FROM password_resets WHERE user_id = ?`, [user.id]);
           db.run(`DELETE FROM users WHERE id = ?`, [user.id]);
         })();
         await Promise.all(remainingFiles.map((f) => removeStoredFile(f.stored_path)));
